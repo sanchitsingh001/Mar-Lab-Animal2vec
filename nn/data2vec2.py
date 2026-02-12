@@ -449,54 +449,69 @@ class Data2VecMultiModel(BaseFairseqModel, FusedSegmentationMixin):
             else:
                 y = y.reshape(-1)
         return y
-
+    
     def compute_gain_torch(self, sound, fs=8_000, wl=0.1, min_db=-80.0, mode="A_weighting"):
         n_fft = round(fs * wl)
-
+    
         if mode == "A_weighting":
-            if not hasattr(self, f"a_weight"):
+            if not hasattr(self, "a_weight"):
                 self.a_weight = {}
-
+    
             if fs not in self.a_weight:
                 def a_weight(fs, n_fft, min_db=-80.0):
                     freq = np.linspace(0, fs // 2, n_fft // 2 + 1)
                     freq_sq = freq ** 2
                     freq_sq[0] = 1.0
                     weight = 2.0 + 20.0 * (
-                            2 * np.log10(12194)
-                            + 2 * np.log10(freq_sq)
-                            - np.log10(freq_sq + 12194 ** 2)
-                            - np.log10(freq_sq + 20.6 ** 2)
-                            - 0.5 * np.log10(freq_sq + 107.7 ** 2)
-                            - 0.5 * np.log10(freq_sq + 737.9 ** 2)
+                        2 * np.log10(12194)
+                        + 2 * np.log10(freq_sq)
+                        - np.log10(freq_sq + 12194 ** 2)
+                        - np.log10(freq_sq + 20.6 ** 2)
+                        - 0.5 * np.log10(freq_sq + 107.7 ** 2)
+                        - 0.5 * np.log10(freq_sq + 737.9 ** 2)
                     )
                     weight = np.maximum(weight, min_db)
-
                     return weight
-
+    
+                # (optional but recommended) keep weights in float32
                 self.a_weight[fs] = torch.from_numpy(
-                    np.power(10, a_weight(fs, n_fft, min_db) / 10)
-                ).to(device=sound.device)
-
-        sound = sound.unfold(-1, n_fft, n_fft // 2)
-
+                    np.power(10, a_weight(fs, n_fft, min_db) / 10).astype(np.float32)
+                ).to(device=sound.device, dtype=torch.float32)
+    
+        # unfold returns a strided view; make it contiguous for safety
+        sound = sound.unfold(-1, n_fft, n_fft // 2).contiguous().float()
+    
         if mode == "RMSE":
             sound = sound ** 2
             g = sound.mean(-1)
+    
         elif mode == "A_weighting":
-            w = torch.hann_window(n_fft, device=sound.device) * sound
-            spec = torch.fft.rfft(w)
+            w = (torch.hann_window(n_fft, device=sound.device, dtype=torch.float32) * sound).contiguous()
+    
+            # ---- THIS IS WHERE YOU ADD THE FALLBACK ----
+            try:
+                spec = torch.fft.rfft(w, dim=-1)
+            except RuntimeError as e:
+                if "cuFFT error" in str(e):
+                    spec = torch.fft.rfft(w.cpu(), dim=-1).to(w.device)
+                else:
+                    raise
+            # -------------------------------------------
+    
             power_spec = spec.abs() ** 2
             a_weighted_spec = power_spec * self.a_weight[fs]
             g = a_weighted_spec.sum(-1)
+    
         else:
             raise Exception("Invalid mode {}".format(mode))
-
-        gain = torch.maximum(g, torch.tensor(10 ** (min_db / 10), device=g.device))
+    
+        gain = torch.maximum(
+            g, torch.tensor(10 ** (min_db / 10), device=g.device, dtype=g.dtype)
+        )
         gain_db = 10 * torch.log10(gain)
-
-        return gain_db
-
+    
+        return gain_db    
+    
     @classmethod
     def build_model(cls, cfg: Data2VecMultiConfig, task=None):
         """Build a new model instance."""

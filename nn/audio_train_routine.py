@@ -263,6 +263,7 @@ def train(
         cfg: DictConfig, trainer: Trainer, task: tasks.FairseqTask, epoch_itr
 ) -> Tuple[List[Optional[float]], bool]:
     """Train the model for one epoch and return validation losses."""
+    
     # Initialize data iterator
     itr = epoch_itr.next_epoch_itr(
         fix_batches_to_gpus=cfg.distributed_training.fix_batches_to_gpus,
@@ -444,7 +445,7 @@ def validate_and_save(
     )
 
     # Validate
-    valid_losses = [None]
+    valid_losses = [0]
     if do_validate:
         trainer._criterion.can_sum = False
         trainer.criterion.can_sum = False

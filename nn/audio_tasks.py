@@ -256,14 +256,19 @@ class FileAudioLabelDataset(RawAudioDataset, ABC):
                     label_size = os.path.getsize(label_file)
                 else:
                     label_size = 0.
-                if (min_sample_size is not None and sz < min_sample_size) or label_size <= min_label_size:
-                    # print("\n min_sample_size is not None", min_sample_size is not None)
-                    # if min_sample_size is not None:
-                    #     print("sz < min_sample_size", sz < min_sample_size, sz, min_sample_size)
-                    # print("label_size <= min_label_size\n ", label_size <= min_label_size, label_size, min_label_size)
+
+                if min_sample_size is not None and sz < min_sample_size:
                     skipped += 1
                     self.skipped_indices.add(i)
                     continue
+                
+                # Allow loading without labels if 'with_labels' is False
+                if return_labels and label_size <= min_label_size:
+                    logger.warning(f"Skipping {items[0]} due to missing or too small labels.")
+                    skipped += 1
+                    self.skipped_indices.add(i)
+                    continue
+
                 self.fnames.append(self.text_compressor.compress(items[0]))
                 sizes.append(sz)
         logger.info(f"loaded {len(self.fnames)}, skipped {skipped} samples")
@@ -328,8 +333,66 @@ class FileAudioLabelDataset(RawAudioDataset, ABC):
             path_or_fp = io.BytesIO(byte_data)
 
         wav, curr_sample_rate = sf.read(path_or_fp, dtype="float32")
-
+        
         feats = torch.from_numpy(wav).float()
+        # force mono to cut memory in half
+        if feats.dim() == 2:
+    # feats is (T, C)
+            feats = feats.mean(dim=1)
+        # --- BEGIN FIX: force resample to target sample rate ---
+        target_sr = self.sample_rate  # e.g. 22000
+        
+        if curr_sample_rate != target_sr:
+            # feats comes from sf.read(); it can be:
+            #   mono:   (T,)
+            #   stereo: (T, C)
+            try:
+                import torchaudio
+        
+                if feats.dim() == 1:
+                    # (T,) -> (1, T)
+                    feats_ch_t = feats.unsqueeze(0)
+                elif feats.dim() == 2:
+                    # (T, C) -> (C, T)
+                    feats_ch_t = feats.transpose(0, 1)
+                else:
+                    raise RuntimeError(f"Unexpected feats shape: {tuple(feats.shape)}")
+        
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=curr_sample_rate,
+                    new_freq=target_sr,
+                )
+                feats_ch_t = resampler(feats_ch_t)
+        
+                # back to original shape expected by fairseq raw_audio_dataset:
+                # typically (T,) for mono, (T, C) for multi-channel
+                if feats.dim() == 1:
+                    feats = feats_ch_t.squeeze(0)          # (1, T) -> (T,)
+                else:
+                    feats = feats_ch_t.transpose(0, 1)     # (C, T) -> (T, C)
+        
+            except Exception:
+                # fallback if torchaudio is unavailable
+                import numpy as np
+                from scipy.signal import resample_poly
+        
+                x = feats.detach().cpu().numpy()
+                if x.ndim == 1:
+                    y = resample_poly(x, target_sr, curr_sample_rate)
+                elif x.ndim == 2:
+                    # (T, C) -> resample each channel
+                    y = np.stack(
+                        [resample_poly(x[:, c], target_sr, curr_sample_rate) for c in range(x.shape[1])],
+                        axis=1
+                    )
+                else:
+                    raise RuntimeError(f"Unexpected numpy shape: {x.shape}")
+        
+                feats = torch.from_numpy(y).to(feats.device).type_as(feats)
+        
+            curr_sample_rate = target_sr
+        # --- END FIX ---
+        print("sr:", curr_sample_rate, "shape:", tuple(feats.shape))
         feats = self.postprocess(feats, curr_sample_rate)
         data_dict = {"id": index, "source": feats}
         # print("\n feats.size", feats.size())

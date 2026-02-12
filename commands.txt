@@ -1,0 +1,12 @@
+#Clustering code
+
+ python /host_root/animal2vec/cluster_a2v1_nips.py   --wav_csv_dir /host_root/cache/a/ssingh/Datasets/Nips/combined_csv_wav   --emb_dir /host_root/cache/a/ssingh/Results/a2v1_nips_embeddings   --index_rate_hz 44100   --k 60   --out_csv /host_root/cache/a/ssingh/Results/a2v1_nips_embeddings/nips_segment_clusters_k87.csv   | tee /host_root/cache/a/ssingh/Results/a2v1_nips_embeddings/k60_run.log
+
+# generating embeddings
+
+ python animal2vec_inference.py   --path /host_root/cache/a/ssingh/Datasets/Nips/combined_csv_wav   --model-path /host_root/cache/a/ssingh/Results/a2v1_results_1/checkpoints/checkpoint_last.pt   --write-embeddings True   --out-path /host_root/cache/a/ssingh/Results/a2v1_nips_embeddings   --device cuda
+
+
+
+
+
