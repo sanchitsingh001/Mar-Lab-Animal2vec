@@ -10,12 +10,13 @@ common:
   fp16_init_scale: 1
 
 checkpoint:
-  save_interval: 10  # that is every 40840 updates
-  keep_last_epochs: 10  # keep all of them, as we train for 100 epochs
-
+  save_dir: /home/ssingh/data/Results/animal2vec_runs/checkpoints
+  save_interval_updates: 100
+  keep_interval_updates: 40
+  save_interval: 999999
 task:
   _name: audio_ccas
-  data: /host_root/cache/a/ssingh/Datasets/Chunked-Xeno/manifest
+  data: /home/ssingh/data/Datasets/processed/Xeno-canto/manifest
   unique_labels: "['beep', 'synch', 'sn', 'cc', 'ld', 'oth', 'mo', 'al', 'soc', 'agg', 'eating', 'focal']"
   # Change feature extractor for MeerKAT
   # 8000Hz / 5 / 2 / 2 / 2 / 1 / 1 / 1 -> Effective encoder output frequency of 200Hz.
@@ -23,24 +24,23 @@ task:
   # 63 filters times 127 Hz resolution each is 8000Hz
   conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 4)] + [(512, 3, 3)] + [(512, 3, 2)] + [(512, 3, 1)] + [(512, 2, 1)] * 2'  
   min_sample_size: 1
-  sample_rate: 24000
+  sample_rate: 32000
   normalize: true
   with_labels: false
   verbose_tensorboard_logging: false
   enable_padding: false
-
 dataset:
-  num_workers: 8
+  num_workers: 16
   # max_tokens / sample_rate * distributed_world_size * update_freq is the batch size in seconds
   # For training on asmodeus, we use 960s for training, as in the paper
-  max_tokens: 240000  #  a token is a single audio frame
+  max_tokens: 768000  #  a token is a single audio frame
   skip_invalid_size_inputs_valid_test: true
   validate_interval: 25
   validate_interval_updates: 10000  # validate every m updates
   required_batch_size_multiple: 1
   disable_validation: true
-  train_subset: pretrain.24k.wav
-  valid_subset: pretrain.24k.wav
+  train_subset: pretrain
+  valid_subset: pretrain
 
 distributed_training:
   distributed_world_size: 1  # Number of GPUs
@@ -91,7 +91,7 @@ model:
   embed_dim: 768
   num_heads: 12
 
-  clone_batch: 12
+  clone_batch: 1
 
   ema_decay: 0.9997
   ema_end_decay: 1

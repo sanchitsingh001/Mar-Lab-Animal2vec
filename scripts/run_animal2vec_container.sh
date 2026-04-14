@@ -1,26 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 IMAGE="animal2vec:py310"
 CONTAINER="animal2vec_run"
 
-# Mount the repo you are CURRENTLY in
-HOST_REPO="$(pwd)"
+# ---- Host paths (cssc) ----
+HOST_REPO="/home/ssingh/Mar-Lab-Animal2vec"
 
-# Optional: where you want results on host (not required for mounting to work)
-HOST_RUNS="/cache/a/ssingh/Results/a2v1_results_1"
+# Prefer the big NVMe data mount (recommended)
+HOST_DATA_ROOT="/storage/data2/rochlab-data/ssingh"
+HOST_DATASET="${HOST_DATA_ROOT}/Datasets/Xeno-canto"
+
+# Where you want results/checkpoints/logs on host
+HOST_RUNS="${HOST_DATA_ROOT}/Results/animal2vec_runs"
 mkdir -p "${HOST_RUNS}"
 
-CONT_ROOT="/host_root"
-CONT_REPO="${CONT_ROOT}/animal2vec"
-CONT_CACHE="${CONT_ROOT}/cache"
+# ---- Container paths ----
+CONT_ROOT="/host"
+CONT_REPO="${CONT_ROOT}/repo"
+CONT_DATA="${CONT_ROOT}/data"
+CONT_RUNS="${CONT_ROOT}/runs"
 
 # If container already exists, remove it so mounts update
 docker rm -f "${CONTAINER}" 2>/dev/null || true
 
+# Run detached and keep alive
 docker run -d \
   --name "${CONTAINER}" \
   --gpus all \
   -v "${HOST_REPO}:${CONT_REPO}" \
-  -v /cache:"${CONT_CACHE}" \
+  -v "${HOST_DATASET}:${CONT_DATA}:ro" \
+  -v "${HOST_RUNS}:${CONT_RUNS}" \
   -w "${CONT_REPO}" \
   "${IMAGE}" \
   sleep infinity
+
+echo "Container started: ${CONTAINER}"
+echo "Repo mounted at:   ${CONT_REPO}"
+echo "Dataset mounted at:${CONT_DATA} (read-only)"
+echo "Runs mounted at:   ${CONT_RUNS}"
 

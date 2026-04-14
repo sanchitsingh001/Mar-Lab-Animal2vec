@@ -962,23 +962,28 @@ def main(args):
                 if args.write_embeddings:  # Iterate over Batch
                     emb_data = np.concatenate(embeddings)
                     f_h5.create_dataset(name="embedding", data=emb_data, dtype=np.float32)  # TC
-                    o_len_mult = np.ceil(wav.shape[0] / args.sample_rate / args.segment_length).astype(int)
-                    o_time_vec = np.linspace(
-                        start=0,
-                        stop=o_len_mult * args.segment_length,
-                        num=int(o_len_mult * args.segment_length * args.sample_rate)
-                    )
-                    interp_time_vec = np.interp(
-                        x=np.linspace(
-                            start=0,
-                            stop=len(o_time_vec),
-                            num=int(emb_data.shape[0])
-                        ),
-                        xp=np.arange(len(o_time_vec)),
-                        fp=o_time_vec
-                    )
-                    f_h5.create_dataset(name="time", data=interp_time_vec, dtype=np.float32)  # TC
-
+#                    o_len_mult = np.ceil(wav.shape[0] / args.sample_rate / args.segment_length).astype(int)
+#                    o_time_vec = np.linspace(
+#                        start=0,
+#                        stop=o_len_mult * args.segment_length,
+#                        num=int(o_len_mult * args.segment_length * args.sample_rate)
+#                    )
+#                    interp_time_vec = np.interp(
+#                        x=np.linspace(
+#                            start=0,
+#                            stop=len(o_time_vec),
+#                            num=int(emb_data.shape[0])
+#                        ),
+#                        xp=np.arange(len(o_time_vec)),
+#                        fp=o_time_vec
+#                    )
+#                    f_h5.create_dataset(name="time", data=interp_time_vec, dtype=np.float32)  # TC
+#
+                    true_dur = wav.shape[0] / args.sample_rate   # duration in seconds of the (resampled) wav tensor
+                    T = emb_data.shape[0]
+                    time_vec = np.linspace(0.0, true_dur, num=T, endpoint=False, dtype=np.float32)
+                    f_h5.create_dataset(name="time", data=time_vec, dtype=np.float32)
+                    
             # the write out routine
             time_intervals = flatten(time_intervals)
             likelihoods = flatten(likelihoods)
