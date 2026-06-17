@@ -26,12 +26,21 @@ import plotly.graph_objects as go
 import plotly.express as px
 import librosa
 import h5py
+import base64
+
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+    _HAS_MPL = True
+except Exception:
+    plt = None
+    _HAS_MPL = False
 
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import (
     adjusted_mutual_info_score,
     adjusted_rand_score,
     normalized_mutual_info_score,
+    rand_score,
     silhouette_score,
 )
 
@@ -48,6 +57,14 @@ try:
 except Exception:
     _HAS_SOUNDFILE = False
     import wave
+
+try:
+    import umap  # type: ignore
+
+    _HAS_UMAP = True
+except Exception:
+    umap = None
+    _HAS_UMAP = False
 
 
 # =========================
@@ -207,6 +224,19 @@ def _candidate_wav_names(wav_file: str) -> List[str]:
     return uniq
 
 
+def _recording_group_id(wav: str) -> str:
+    """
+    Map a wav basename to a parent "recording" id. Segment exports like
+    ``nips4b_birds_trainfile685_00000s_00005s.wav`` share one id ``nips4b_birds_trainfile685``.
+    """
+    base = os.path.basename(str(wav).strip())
+    m = _NIPS_SEGMENT_WAV_RE.match(base)
+    if m:
+        return str(m.group("stem"))
+    stem = Path(base).stem if base else ""
+    return stem if stem else base
+
+
 def resolve_audio_path(audio_root: str, wav_file: str) -> str:
     wav_file = str(wav_file)
     audio_root = str(audio_root)
@@ -355,6 +385,54 @@ def recording_stem_from_segment_h5_name(h5_name: str) -> Optional[str]:
     return _SEGMENT_WINDOW_RE.sub("", left)
 
 
+def wav_stem_from_h5_name(h5_name: str) -> str:
+    """Derive the .wav stem from an embedding .h5 filename."""
+    name = Path(h5_name).name
+    if ".wav_embeddings_" in name:
+        left = name.split(".wav_embeddings_", 1)[0]
+    else:
+        left = name.split("_embeddings_", 1)[0]
+    return Path(left).stem
+
+
+def resolve_csv_path(
+    wav_csv_dir: Path,
+    *,
+    h5_name: str,
+    wav_name: str,
+    segment_h5_use_recording_csv: bool,
+) -> Tuple[Optional[Path], str, str]:
+    """
+    Find the annotation CSV for one embedding .h5 file.
+
+    Tries, in order:
+      1. Per-file CSV — ``{wav_stem}.csv`` (full recording or segment clip)
+      2. Recording CSV — ``{recording_stem}.csv`` (segment H5 → parent recording)
+    """
+    stem_candidates: List[str] = []
+    h5_stem = wav_stem_from_h5_name(h5_name)
+    if h5_stem:
+        stem_candidates.append(h5_stem)
+    if wav_name:
+        wav_stem = Path(wav_name).stem
+        if wav_stem and wav_stem not in stem_candidates:
+            stem_candidates.append(wav_stem)
+
+    for stem in stem_candidates:
+        segment_csv = wav_csv_dir / f"{stem}.csv"
+        if segment_csv.exists():
+            return segment_csv, stem, "file_csv"
+
+    if segment_h5_use_recording_csv or ".wav_embeddings_" in h5_name:
+        rec_stem = recording_stem_from_segment_h5_name(h5_name)
+        if rec_stem is not None:
+            recording_csv = wav_csv_dir / f"{rec_stem}.csv"
+            if recording_csv.exists():
+                return recording_csv, rec_stem, "recording_csv"
+
+    return None, (stem_candidates[0] if stem_candidates else ""), "none"
+
+
 def read_label_csv(csv_path: Path) -> Optional[pd.DataFrame]:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return None
@@ -475,61 +553,35 @@ def maybe_add_labels_from_csv(
     for _, g in df_frames.groupby("h5_path", sort=False):
         g = g.sort_values("frame_idx")
         h5_name = str(g["h5_name"].iloc[0])
+        wav_name = str(g["wav"].iloc[0]).strip()
 
-        # Auto-detect segment-export H5 naming so it still works even if the checkbox is forgotten.
-        auto_segment_mode = bool(segment_h5_use_recording_csv) or (".wav_embeddings_" in h5_name)
+        csv_path, recording_id, match_mode = resolve_csv_path(
+            wav_csv_dir_p,
+            h5_name=h5_name,
+            wav_name=wav_name,
+            segment_h5_use_recording_csv=segment_h5_use_recording_csv,
+        )
 
-        if auto_segment_mode:
-            rec_stem = recording_stem_from_segment_h5_name(h5_name)
-            if rec_stem is None:
-                debug_rows.append(
-                    {
-                        "h5_name": h5_name,
-                        "mode": "segment_h5->recording_csv",
-                        "reason": "could not derive recording stem from h5 name",
-                        "csv_path": None,
-                    }
-                )
-                continue
-
-            if ignore_test_files and "testfile" in rec_stem.lower():
-                debug_rows.append(
-                    {
-                        "h5_name": h5_name,
-                        "mode": "segment_h5->recording_csv",
-                        "reason": "skipped test file",
-                        "csv_path": None,
-                    }
-                )
-                continue
-
-            csv_path = wav_csv_dir_p / f"{rec_stem}.csv"
-            recording_id = rec_stem
-        else:
-            wav_name = str(g["wav"].iloc[0]).strip()
-            stem = Path(wav_name).stem
-
-            if ignore_test_files and "testfile" in stem.lower():
-                debug_rows.append(
-                    {
-                        "h5_name": h5_name,
-                        "mode": "direct_stem_csv",
-                        "reason": "skipped test file",
-                        "csv_path": None,
-                    }
-                )
-                continue
-
-            csv_path = wav_csv_dir_p / f"{stem}.csv"
-            recording_id = stem
-
-        if not csv_path.exists():
+        if ignore_test_files and (
+            "testfile" in recording_id.lower() or "testfile" in wav_name.lower()
+        ):
             debug_rows.append(
                 {
                     "h5_name": h5_name,
-                    "mode": "segment_h5->recording_csv" if auto_segment_mode else "direct_stem_csv",
+                    "mode": match_mode,
+                    "reason": "skipped test file",
+                    "csv_path": str(csv_path) if csv_path is not None else None,
+                }
+            )
+            continue
+
+        if csv_path is None or not csv_path.exists():
+            debug_rows.append(
+                {
+                    "h5_name": h5_name,
+                    "mode": match_mode,
                     "reason": "csv not found",
-                    "csv_path": str(csv_path),
+                    "csv_path": str(wav_csv_dir_p / f"{recording_id}.csv") if recording_id else None,
                 }
             )
             continue
@@ -539,7 +591,7 @@ def maybe_add_labels_from_csv(
             debug_rows.append(
                 {
                     "h5_name": h5_name,
-                    "mode": "segment_h5->recording_csv" if auto_segment_mode else "direct_stem_csv",
+                    "mode": match_mode,
                     "reason": "csv exists but could not be parsed",
                     "csv_path": str(csv_path),
                 }
@@ -556,7 +608,7 @@ def maybe_add_labels_from_csv(
             debug_rows.append(
                 {
                     "h5_name": h5_name,
-                    "mode": "segment_h5->recording_csv" if auto_segment_mode else "direct_stem_csv",
+                    "mode": match_mode,
                     "reason": f"all csv rows removed by filters (before={before})",
                     "csv_path": str(csv_path),
                 }
@@ -581,7 +633,7 @@ def maybe_add_labels_from_csv(
             debug_rows.append(
                 {
                     "h5_name": h5_name,
-                    "mode": "segment_h5->recording_csv" if auto_segment_mode else "direct_stem_csv",
+                    "mode": match_mode,
                     "reason": "csv matched but no frame times fell into any segment",
                     "csv_path": str(csv_path),
                 }
@@ -591,7 +643,7 @@ def maybe_add_labels_from_csv(
         debug_rows.append(
             {
                 "h5_name": h5_name,
-                "mode": "segment_h5->recording_csv" if auto_segment_mode else "direct_stem_csv",
+                "mode": match_mode,
                 "reason": f"success: labeled {labeled_count} frames",
                 "csv_path": str(csv_path),
             }
@@ -658,12 +710,22 @@ def cluster_embeddings_df(
 
     out.attrs["cluster_metrics"] = extra
 
-    cols = ["cluster_id", "wav", "start_s", "end_s", "class_name", "h5_path", "frame_idx", "time_s"]
+    cols = [
+        "cluster_id",
+        "wav",
+        "start_s",
+        "end_s",
+        "class_name",
+        "h5_path",
+        "frame_idx",
+        "time_s",
+        "embedding_vec",
+    ]
     for extra_col in ["segment_start_s", "segment_end_s", "segment_uid"]:
         if extra_col in out.columns:
             cols.append(extra_col)
 
-    return out[cols]
+    return out[[c for c in cols if c in out.columns]]
 
 
 def summarize_clustering(
@@ -693,11 +755,300 @@ def summarize_clustering(
     if "class_name" in df_results.columns:
         y_true = df_results["class_name"].astype(str)
         if not bool((y_true.str.lower() == "unknown").all()):
-            out["nmi_vs_class_name"] = float(normalized_mutual_info_score(y_true.to_numpy(), labels))
-            out["ami_vs_class_name"] = float(adjusted_mutual_info_score(y_true.to_numpy(), labels))
-            out["ari_vs_class_name"] = float(adjusted_rand_score(y_true.to_numpy(), labels))
+            yt = y_true.to_numpy()
+            out["ri_vs_class_name"] = float(rand_score(yt, labels))
+            out["nmi_vs_class_name"] = float(normalized_mutual_info_score(yt, labels))
+            out["ami_vs_class_name"] = float(adjusted_mutual_info_score(yt, labels))
+            out["ari_vs_class_name"] = float(adjusted_rand_score(yt, labels))
 
     return out
+
+
+def _format_kmeans_params(*, k: int, random_state: int) -> str:
+    return (
+        f"k={k}, random_state={random_state}, init=k-means++, "
+        f"n_init=10, batch_size=128 (MiniBatchKMeans)"
+    )
+
+
+def _format_hdbscan_params(
+    *,
+    min_cluster_size: int,
+    min_samples: int,
+    metric: str,
+    cluster_selection_method: str,
+) -> str:
+    ms = "None" if int(min_samples) <= 0 else str(int(min_samples))
+    return (
+        f"min_cluster_size={min_cluster_size}, min_samples={ms}, "
+        f"metric={metric}, cluster_selection_method={cluster_selection_method}"
+    )
+
+
+def build_professor_summary_table(
+    *,
+    algorithm: str,
+    diag: Dict[str, float],
+    df_results: pd.DataFrame,
+    random_state: int,
+    k_value: Optional[int] = None,
+    min_cluster_size: Optional[int] = None,
+    min_samples: Optional[int] = None,
+    metric: Optional[str] = None,
+    cluster_selection_method: Optional[str] = None,
+    use_csv_labels: bool = False,
+    label_filters: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """Two-column table (Field / Value) for pasting into a spreadsheet."""
+    algo = str(algorithm).strip()
+    is_kmeans = algo.lower().replace("-", "") == "kmeans"
+
+    kmeans_str = "—"
+    hdbscan_str = "—"
+    if is_kmeans and k_value is not None:
+        kmeans_str = _format_kmeans_params(k=int(k_value), random_state=int(random_state))
+        params_summary = kmeans_str
+    elif min_cluster_size is not None:
+        hdbscan_str = _format_hdbscan_params(
+            min_cluster_size=int(min_cluster_size),
+            min_samples=int(min_samples or 0),
+            metric=str(metric or "euclidean"),
+            cluster_selection_method=str(cluster_selection_method or "eom"),
+        )
+        params_summary = hdbscan_str
+    else:
+        params_summary = "—"
+
+    n_examples = int(diag.get("n_points", len(df_results)))
+    n_clusters = int(diag.get("n_clusters_including_noise", 0))
+
+    if "class_name" in df_results.columns:
+        gt = df_results["class_name"].astype(str)
+        gt_labeled = gt[gt.str.lower() != "unknown"]
+        n_categories: object = int(gt_labeled.nunique()) if len(gt_labeled) > 0 else "—"
+    else:
+        n_categories = "—"
+
+    def _metric_val(key: str) -> str:
+        val = diag.get(key)
+        if val is None:
+            return "—"
+        return f"{float(val):.6f}"
+
+    rows: List[Tuple[str, str]] = [
+        ("Algorithm", algo),
+        ("Parameters", params_summary),
+        ("k-means", kmeans_str),
+        ("hdbscan", hdbscan_str),
+        ("", ""),
+        ("Number of examples clustered", str(n_examples)),
+        ("Number of categories (ground truth)", str(n_categories)),
+        ("Number of clusters (predicted)", str(n_clusters)),
+        ("Noise points (HDBSCAN -1)", str(int(diag.get("n_noise", 0)))),
+        ("", ""),
+        ("Rand index (RI)", _metric_val("ri_vs_class_name")),
+        ("Adjusted Rand index (ARI)", _metric_val("ari_vs_class_name")),
+        ("Normalized mutual information (NMI)", _metric_val("nmi_vs_class_name")),
+        ("Adjusted mutual information (AMI)", _metric_val("ami_vs_class_name")),
+        ("Silhouette", _metric_val("silhouette")),
+    ]
+
+    if use_csv_labels and label_filters:
+        rows.extend([("", ""), ("Label filters", "")])
+        for k, v in label_filters.items():
+            rows.append((k, v))
+
+    return pd.DataFrame(rows, columns=["Field", "Value"])
+
+
+def _professor_summary_tsv(summary_df: pd.DataFrame) -> str:
+    lines = ["Field\tValue"]
+    for _, row in summary_df.iterrows():
+        field = str(row["Field"]).replace("\t", " ")
+        value = str(row["Value"]).replace("\t", " ")
+        lines.append(f"{field}\t{value}")
+    return "\n".join(lines)
+
+
+def _dataframe_has_usable_embeddings(df: pd.DataFrame) -> bool:
+    if "embedding_vec" not in df.columns:
+        return False
+    s = df["embedding_vec"].dropna()
+    if len(s) == 0:
+        return False
+    v0 = s.iloc[0]
+    return isinstance(v0, (np.ndarray, list, tuple))
+
+
+def _cluster_summary_table(df: pd.DataFrame, *, include_noise: bool) -> pd.DataFrame:
+    d = df if include_noise else df.loc[df["cluster_id"].to_numpy() != -1].copy()
+    rows: List[Dict] = []
+    for cid, sub in d.groupby("cluster_id", sort=True):
+        n = int(len(sub))
+        nwav = int(sub["wav"].nunique())
+        rec_id = sub["wav"].map(_recording_group_id)
+        nrec = int(rec_id.nunique())
+        vc_w = sub["wav"].astype(str).value_counts()
+        dom_wav = str(vc_w.index[0]) if n else "—"
+        wav_pur = float(vc_w.iloc[0] / n) if n else 0.0
+        vc_r = rec_id.value_counts()
+        dom_rec = str(vc_r.index[0]) if n else "—"
+        rec_pur = float(vc_r.iloc[0] / n) if n else 0.0
+        if "class_name" in sub.columns:
+            vc = sub["class_name"].astype(str).value_counts()
+            dom = str(vc.index[0])
+            pur = float(vc.iloc[0] / n) if n else 0.0
+        else:
+            dom, pur = "—", float("nan")
+        rows.append(
+            {
+                "cluster_id": int(cid),
+                "n_frames": n,
+                "n_wav": nwav,
+                "n_recordings": nrec,
+                "dominant_wav": dom_wav,
+                "wav_purity": wav_pur,
+                "dominant_recording": dom_rec,
+                "recording_purity": rec_pur,
+                "dominant_class": dom,
+                "class_purity": pur,
+            }
+        )
+    out = pd.DataFrame(rows)
+    if len(out) == 0:
+        return out
+    return out.sort_values("n_frames", ascending=False).reset_index(drop=True)
+
+
+def _cluster_centroid_matrix(
+    df: pd.DataFrame, *, include_noise: bool
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    """One pass: return (centroids (K,D), counts (K,), cluster ids sorted)."""
+    work = df if include_noise else df.loc[df["cluster_id"].to_numpy() != -1].copy()
+    sums: Dict[int, np.ndarray] = {}
+    counts: Dict[int, int] = {}
+    dim: Optional[int] = None
+    for t in work.itertuples(index=False):
+        cid = int(t.cluster_id)
+        v = np.asarray(t.embedding_vec, dtype=np.float64)
+        if dim is None:
+            dim = int(v.shape[0])
+        if cid not in sums:
+            sums[cid] = np.zeros(dim, dtype=np.float64)
+            counts[cid] = 0
+        sums[cid] += v
+        counts[cid] += 1
+    ids = sorted(sums.keys())
+    if not ids:
+        return np.zeros((0, 0), dtype=np.float64), np.zeros((0,), dtype=np.int64), []
+    C = np.stack([sums[i] / float(counts[i]) for i in ids])
+    cnt = np.array([counts[i] for i in ids], dtype=np.int64)
+    return C, cnt, ids
+
+
+def _small_pie_data_uri(labels: List[str], counts: List[int]) -> Optional[str]:
+    """
+    Return a small PNG pie as a data URI for Streamlit ImageColumn.
+    Falls back to None if matplotlib isn't available.
+    """
+    if not _HAS_MPL or plt is None:
+        return None
+    if not labels or not counts or int(sum(counts)) <= 0:
+        return None
+
+    try:
+        fig = plt.figure(figsize=(1.0, 1.0), dpi=140)
+        ax = fig.add_subplot(111)
+        ax.pie(
+            counts,
+            labels=None,
+            startangle=90,
+            counterclock=False,
+            wedgeprops=dict(width=0.85, edgecolor="white", linewidth=0.4),
+        )
+        ax.set_aspect("equal")
+        ax.set_axis_off()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.0, transparent=True)
+        plt.close(fig)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+def _cluster_pie_for_distribution(
+    df_all: pd.DataFrame,
+    cluster_id: int,
+    *,
+    basis: str = "auto",
+    top_k: int = 5,
+) -> Tuple[Optional[str], str]:
+    """
+    Create a small pie chart for one cluster and return (data_uri, basis_label).
+    basis:
+      - "auto": prefer `class_name` (if any non-Unknown), else `wav`
+      - "class_name": `class_name` distribution (drops Unknown if any non-Unknown else uses all)
+      - "wav": exact wav basename distribution
+      - "recording_id": parent recording id distribution (segment windows merged)
+      - "h5_path": source h5 file distribution
+    """
+    sub = df_all[df_all["cluster_id"] == int(cluster_id)].copy()
+    if len(sub) == 0:
+        return None, "—"
+
+    s: Optional[pd.Series] = None
+    basis_label = str(basis)
+
+    if basis == "auto":
+        if "class_name" in sub.columns:
+            cls = sub["class_name"].astype(str)
+            non_unknown = cls.str.lower().to_numpy() != "unknown"
+            if bool(non_unknown.any()):
+                s = cls[non_unknown]
+                basis_label = "class_name"
+        if s is None:
+            s = sub["wav"].astype(str)
+            basis_label = "wav"
+    elif basis == "class_name":
+        if "class_name" not in sub.columns:
+            return None, "class_name (missing)"
+        cls = sub["class_name"].astype(str)
+        non_unknown = cls.str.lower().to_numpy() != "unknown"
+        s = cls[non_unknown] if bool(non_unknown.any()) else cls
+        basis_label = "class_name"
+    elif basis == "wav":
+        s = sub["wav"].astype(str)
+        basis_label = "wav"
+    elif basis == "recording_id":
+        s = sub["wav"].map(_recording_group_id).astype(str)
+        basis_label = "recording_id"
+    elif basis == "h5_path":
+        if "h5_path" not in sub.columns:
+            return None, "h5_path (missing)"
+        s = sub["h5_path"].astype(str)
+        basis_label = "h5_path"
+    else:
+        return None, f"{basis} (unknown)"
+
+    vc = s.value_counts()
+    if len(vc) == 0:
+        return None, basis_label
+
+    head = vc.head(int(max(1, top_k)))
+    other = int(vc.iloc[int(max(1, top_k)) :].sum()) if len(vc) > int(max(1, top_k)) else 0
+    labels = head.index.astype(str).tolist()
+    counts = head.to_numpy(dtype=int).tolist()
+    if other > 0:
+        labels.append("Other")
+        counts.append(int(other))
+
+    return _small_pie_data_uri(labels, counts), basis_label
 
 
 # =========================
@@ -969,9 +1320,10 @@ with tab2:
                     st.metric("Silhouette (subsample)", "—" if sil is None else f"{sil:.4f}")
 
                 if "nmi_vs_class_name" in diag:
-                    st.caption("Mutual information computed vs `class_name` column (if present).")
+                    st.caption("Frame-level scores vs `class_name` ground truth.")
                     st.write(
                         {
+                            "RI_vs_class_name": round(float(diag.get("ri_vs_class_name", 0.0)), 6),
                             "ARI_vs_class_name": round(float(diag.get("ari_vs_class_name", 0.0)), 6),
                             "NMI_vs_class_name": round(float(diag["nmi_vs_class_name"]), 6),
                             "AMI_vs_class_name": round(float(diag["ami_vs_class_name"]), 6),
@@ -984,9 +1336,50 @@ with tab2:
                     )
 
             algo_tag = "hdbscan" if algorithm == "HDBSCAN" else "kmeans"
+
+            label_filter_notes: Dict[str, str] = {}
+            if use_csv_labels:
+                label_filter_notes = {
+                    "use_csv_labels": "yes",
+                    "filter_noise": "yes" if filter_noise else "no",
+                    "ignore_test_files": "yes" if ignore_test_files else "no",
+                    "only_call": "yes" if only_call else "no",
+                    "max_segment_duration_s": str(max_segment_duration),
+                    "min_label_count": str(min_label_count),
+                    "max_samples_per_label": str(max_samples_per_label),
+                }
+
+            summary_df = build_professor_summary_table(
+                algorithm=algorithm,
+                diag=diag,
+                df_results=df_results,
+                random_state=int(random_state),
+                k_value=int(k_value) if algorithm == "K-Means" else None,
+                min_cluster_size=int(min_cluster_size) if algorithm == "HDBSCAN" else None,
+                min_samples=int(min_samples) if algorithm == "HDBSCAN" else None,
+                metric=str(metric) if algorithm == "HDBSCAN" else None,
+                cluster_selection_method=str(cluster_selection_method) if algorithm == "HDBSCAN" else None,
+                use_csv_labels=bool(use_csv_labels),
+                label_filters=label_filter_notes if use_csv_labels else None,
+            )
+
+            with st.container(border=True):
+                st.subheader("Copy for comparison table")
+                st.caption(
+                    "Paste into your professor's spreadsheet: select the table below, or copy from the "
+                    "tab-separated box (Field in column A, Value in column B)."
+                )
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.text_area(
+                    "Tab-separated (Excel / Google Sheets paste)",
+                    value=_professor_summary_tsv(summary_df),
+                    height=320,
+                    key=f"professor_summary_tsv_{algo_tag}_{int(random_state)}",
+                )
+
             output_csv = f"cluster_results_{algo_tag}.csv"
             try:
-                df_results.to_csv(output_csv, index=False)
+                df_results.drop(columns=["embedding_vec"], errors="ignore").to_csv(output_csv, index=False)
             except Exception:
                 pass
 
@@ -1046,6 +1439,828 @@ with tab3:
         if "audio_folder" not in st.session_state:
             st.session_state["audio_folder"] = "/home/ssingh/data/Datasets/Nips"
         audio_folder = st.text_input("Audio Folder Path for Playback", key="audio_folder")
+
+        with st.expander("Global cluster overview (sizes, class mix, UMAP)", expanded=True):
+            with st.expander("How to read every chart (plain language)", expanded=True):
+                st.markdown(
+                    r"""
+### Before you look at any plot
+
+- The model **did not** use filenames or species labels to form clusters. It only grouped **similar embedding vectors**.
+- Every row in your results is **one short time slice (frame)** from one **`.wav`** (`wav` column). Labels (`class_name`) are only for **checking** clusters afterward.
+
+**Suggested order:** bar chart → file-mix dots → summary table / inspect → heatmaps → UMAP (optional) → spectrograms at the bottom.
+
+---
+
+### 1) Bar chart — “Top clusters by frame count”
+
+- **X-axis:** `cluster_id` (the ID the algorithm gave each pile of frames).
+- **Y-axis:** how many **frames** ended up in that cluster (taller = bigger cluster).
+- **How to read:** identifies **which cluster IDs matter by size**. It does **not** say *why* they group or *which species* they are.
+
+---
+
+### 2) Scatter — “Wav-file diversity vs. single-file dominance”
+
+- **Each dot = one entire cluster** (not one frame).
+- **X-axis (`n_wav`):** number of **different `.wav` filenames** that contributed frames to that cluster.
+- **Y-axis (`wav_purity`):** between 0 and 1. **1.0** ≈ “almost every frame in this cluster comes from the **same** `.wav` file.” **Lower** ≈ frames are **split across** more files.
+- **Dot size:** bigger = more frames in that cluster (`n_frames`).
+- **Color:** same information as Y (brighter ≈ more “single-file” cluster).
+- **How to read:**  
+  - **Left + high on the chart:** cluster is **dominated by one (or few) files** — often “this recording’s acoustic fingerprint.”  
+  - **Far to the right:** **many different files** land in the same cluster — more like “embedding says these frames are similar **across** recordings.”  
+- **Hover** the dot: see `cluster_id`, `dominant_wav`, counts.
+
+---
+
+### 3) Scatter — “Recording-level diversity (segment windows merged)”
+
+- Same logic as (2), but **X / Y use parent recordings**: short clips like `…_00000s_00005s.wav` are **folded into one parent** id so you don’t double-count the same underlying recording.
+- **How to read:** “Is this cluster mostly **one session/recording** or **spread across many**?” Use this when your data has many small segment files per recording.
+
+---
+
+### 4) Cluster summary table (+ progress bars)
+
+- **One row = one cluster.**
+- **`n_frames`:** size of the cluster.  
+- **`n_wav` / `wav_purity`:** file mixing (see scatter (2)).  
+- **`n_recordings` / `recording_purity`:** same after merging segments (see (3)).  
+- **`dominant_class` / `class_purity`:** if you had CSV labels — does this cluster **agree with one species/call type** or is it **mixed** labels?  
+- **Progress bars:** quick visual of purities (full bar ≈ very “pure”).
+
+---
+
+### 5) “Inspect one cluster” tables
+
+- Pick a **cluster_id**; you get **counts and %** of frames per **exact `.wav`** and per **parent recording**.
+- **How to read:** the **ground truth for filenames** for that cluster — who actually contributed frames.
+
+---
+
+### 6) Class heatmap — “Class mixture within top clusters”
+
+- **Each row = one cluster** (only the **largest** clusters by frame count, controlled by the slider).
+- **Each column = one label** (`class_name` from CSV).
+- **Cell color:** **row-normalized** — for that cluster, what **fraction** of its frames have that label. **Each row sums to 1** across columns.
+- **Dark vs bright (Viridis):** **brighter** = **larger share** of that cluster has that class; **darker** ≈ almost no frames with that class.
+- **How to read:** “Does this cluster **line up with one biology label** or **mix labels**?” Only meaningful if labels are trustworthy.
+
+---
+
+### 7) Recording heatmap — “Recording mixture…”
+
+- Same as (6), but columns are **parent recording ids** instead of species classes.
+- **How to read:** “Is this cluster **anchored on a few recordings** or **spread**?” Complements the scatter (3).
+
+---
+
+### 8) Frame UMAP (if shown)
+
+- **Each dot = one frame** (subsampled). **X/Y are not time** — they are a **2D squeeze** of high-dimensional embeddings for visualization only.
+- **Color** (dropdown): color by `cluster_id`, `class_name`, or `wav` to see if dots **separate** or **overlap**.
+- **How to read:** only for **rough** shape (“blobs”, overlap). **Messy is normal.** Don’t over-interpret exact distances.
+
+---
+
+### 9) Centroid UMAP (if shown)
+
+- **Each dot = one cluster** (position = UMAP of the **mean embedding** of that cluster).
+- **Size** ≈ cluster size; **color** = dominant class (if available).
+- **Hover:** includes `n_wav`, `wav_purity`, `dominant_wav`.
+- **How to read:** which clusters are **near each other in embedding space** (coarse), not a statistical test.
+
+---
+
+### 10) Spectrograms further down (per selected cluster)
+
+- **How to read:** “**What does this cluster sound like?**” You hear/see **examples**; use together with **`wav`** and **`class_name`** on each tile.
+
+---
+
+### Tiny glossary
+
+- **Frame:** one embedding vector at one time in one file.  
+- **Cluster:** a group of frames the algorithm thinks are similar.  
+- **Purity:** how much one label or one file “wins” inside that group (0 = perfectly mixed, 1 = all the same).
+                    """
+                )
+            st.caption(
+                "Cluster heatmaps and size bars work from any loaded results. "
+                "UMAP needs `umap-learn` and in-memory `embedding_vec` from Tab 2 "
+                "(CSV export omits embeddings to keep files small)."
+            )
+            n_clust_global = int(df["cluster_id"].nunique())
+            hm_max = max(1, min(120, n_clust_global))
+            hm_default = min(40, hm_max)
+            g1, g2, g3 = st.columns(3)
+            with g1:
+                g_include_noise = st.checkbox(
+                    "Include HDBSCAN noise (-1) in overview",
+                    value=True,
+                    key="global_include_noise",
+                )
+            with g2:
+                heatmap_top_k = st.slider(
+                    "Top clusters (by frame count) for bars / heatmap",
+                    1,
+                    hm_max,
+                    hm_default,
+                    key="global_heatmap_top_k",
+                )
+            with g3:
+                umap_max_pts = st.slider(
+                    "Max points for frame UMAP",
+                    1000,
+                    50000,
+                    15000,
+                    500,
+                    key="global_umap_max_pts",
+                    help="Random subsample for speed; centroids still use all frames.",
+                )
+
+            g4, g5 = st.columns(2)
+            with g4:
+                umap_metric = st.selectbox("UMAP metric", ["cosine", "euclidean"], index=0, key="global_umap_metric")
+            with g5:
+                umap_color_by = st.selectbox(
+                    "Color frame UMAP by",
+                    ["cluster_id", "class_name", "wav"],
+                    index=0,
+                    key="global_umap_color",
+                )
+
+            g6, g7 = st.columns(2)
+            with g6:
+                rec_hm_top = st.slider(
+                    "Recording heatmap: top N parent recordings (global frame count)",
+                    5,
+                    60,
+                    15,
+                    key="global_rec_hm_top",
+                    help="Segment exports share one parent id (strip _00000s_00005s-style suffix).",
+                )
+            with g7:
+                st.caption(
+                    "Lower **n_wav** / high **wav_purity** ⇒ cluster is driven by one file; "
+                    "high **n_wav** ⇒ mixed files."
+                )
+
+            work_global = df if g_include_noise else df.loc[df["cluster_id"].to_numpy() != -1].copy()
+            if len(work_global) == 0:
+                st.warning("No rows after excluding noise (-1).")
+            else:
+                vc = work_global["cluster_id"].value_counts()
+                vc_top = vc.head(int(heatmap_top_k))
+                vc_top_df = pd.DataFrame(
+                    {"cluster_id": vc_top.index.to_numpy(), "count": vc_top.to_numpy(dtype=np.int64)}
+                )
+                fig_sz = px.bar(
+                    vc_top_df,
+                    x="cluster_id",
+                    y="count",
+                    text="count",
+                    title=f"Top {len(vc_top)} clusters by frame count",
+                )
+                fig_sz.update_layout(xaxis_title="cluster_id", yaxis_title="frames", xaxis_tickangle=-45)
+                st.plotly_chart(fig_sz, use_container_width=True)
+
+                summ = _cluster_summary_table(df, include_noise=g_include_noise)
+                if len(summ) > 0:
+                    _mix_tmpl = "plotly_dark" if st.session_state.get("dark_mode", True) else "plotly_white"
+                    st.subheader("File mix per cluster (visual)")
+                    st.caption(
+                        "**Each point = one cluster.** **X** = how many different `.wav` files appear. "
+                        "**Y** = `wav_purity` (fraction of frames from the single most common wav). "
+                        "**Size** ∝ cluster size (`n_frames`). **Bright color** = high purity (one file dominates). "
+                        "**Upper-left** (small x, high y): mostly one or few wavs. **Toward the right** (large x): more files mixed into the same cluster."
+                    )
+                    smix = summ.copy()
+                    smix["marker_n"] = np.sqrt(smix["n_frames"].astype(float).clip(lower=1.0))
+                    _scatter_meta_cols = [
+                        "cluster_id", "n_frames", "dominant_class", "class_purity",
+                        "n_wav", "wav_purity", "n_recordings", "recording_purity",
+                        "dominant_wav", "dominant_recording",
+                    ]
+                    fig_mix = px.scatter(
+                        smix,
+                        x="n_wav",
+                        y="wav_purity",
+                        size="marker_n",
+                        color="wav_purity",
+                        color_continuous_scale="Plasma",
+                        hover_name="cluster_id",
+                        hover_data=[
+                            "n_frames",
+                            "dominant_wav",
+                            "n_recordings",
+                            "recording_purity",
+                            "dominant_recording",
+                        ],
+                        custom_data=_scatter_meta_cols,
+                        labels={
+                            "n_wav": "Distinct .wav files",
+                            "wav_purity": "Wav purity (1 = single file dominates)",
+                        },
+                        title="Wav-file diversity vs. single-file dominance",
+                    )
+                    fig_mix.update_layout(
+                        template=_mix_tmpl,
+                        height=420,
+                        xaxis=dict(rangemode="tozero"),
+                        yaxis=dict(range=[-0.05, 1.05]),
+                        showlegend=True,
+                        dragmode="select",
+                    )
+                    fig_mix.update_traces(marker=dict(line=dict(width=0.6, color="rgba(255,255,255,0.35)"), opacity=0.9))
+                    _scatter_event = st.plotly_chart(
+                        fig_mix, use_container_width=True,
+                        on_select="rerun", key="scatter_sel_wav",
+                    )
+
+                    _sel_pts: list = []
+                    if _scatter_event is not None:
+                        _sel_obj = getattr(_scatter_event, "selection", None)
+                        if _sel_obj is not None:
+                            _sel_pts = getattr(_sel_obj, "points", []) or []
+
+                    if _sel_pts:
+                        _sel_rows: List[Dict] = []
+                        for _pt in _sel_pts:
+                            _cd = (
+                                _pt.get("customdata")
+                                if isinstance(_pt, dict)
+                                else getattr(_pt, "customdata", None)
+                            )
+                            if _cd is not None and len(_cd) >= len(_scatter_meta_cols):
+                                _sel_rows.append(dict(zip(_scatter_meta_cols, _cd)))
+                        if _sel_rows:
+                            _sel_clust_df = pd.DataFrame(_sel_rows)
+                            for _ic in ("cluster_id", "n_frames", "n_wav", "n_recordings"):
+                                if _ic in _sel_clust_df.columns:
+                                    _sel_clust_df[_ic] = (
+                                        pd.to_numeric(_sel_clust_df[_ic], errors="coerce")
+                                        .fillna(0)
+                                        .astype(int)
+                                    )
+                            for _fc in ("class_purity", "wav_purity", "recording_purity"):
+                                if _fc in _sel_clust_df.columns:
+                                    _sel_clust_df[_fc] = (
+                                        pd.to_numeric(_sel_clust_df[_fc], errors="coerce")
+                                        .astype(float)
+                                        .round(3)
+                                    )
+                            _sel_clust_df = _sel_clust_df.drop_duplicates(subset=["cluster_id"])
+                            if _HAS_MPL:
+                                pies_class: List[Optional[str]] = []
+                                pies_wav: List[Optional[str]] = []
+                                for _cid in _sel_clust_df["cluster_id"].tolist():
+                                    _uri_class, _ = _cluster_pie_for_distribution(
+                                        work_global,
+                                        int(_cid),
+                                        basis="class_name",
+                                        top_k=5,
+                                    )
+                                    _uri_wav, _ = _cluster_pie_for_distribution(
+                                        work_global,
+                                        int(_cid),
+                                        basis="wav",
+                                        top_k=5,
+                                    )
+                                    pies_class.append(_uri_class)
+                                    pies_wav.append(_uri_wav)
+                                _sel_clust_df["pie_class"] = pies_class
+                                _sel_clust_df["pie_wav"] = pies_wav
+                            st.caption(f"**{len(_sel_clust_df)}** cluster(s) selected via box / lasso.")
+                            _sel_col_cfg = {
+                                "wav_purity": st.column_config.ProgressColumn(
+                                    "wav purity", format="%.2f", min_value=0.0, max_value=1.0,
+                                ),
+                                "recording_purity": st.column_config.ProgressColumn(
+                                    "rec. purity", format="%.2f", min_value=0.0, max_value=1.0,
+                                ),
+                                "class_purity": st.column_config.ProgressColumn(
+                                    "class purity", format="%.2f", min_value=0.0, max_value=1.0,
+                                ),
+                            }
+                            if "pie_class" in _sel_clust_df.columns:
+                                _sel_col_cfg["pie_class"] = st.column_config.ImageColumn(
+                                    "class pie",
+                                    help="Within-cluster label distribution (`class_name`).",
+                                    width="small",
+                                )
+                            if "pie_wav" in _sel_clust_df.columns:
+                                _sel_col_cfg["pie_wav"] = st.column_config.ImageColumn(
+                                    "wav pie",
+                                    help="Within-cluster wav-file distribution (`wav`).",
+                                    width="small",
+                                )
+                            st.dataframe(
+                                _sel_clust_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config=_sel_col_cfg,
+                            )
+                            _sel_clust_ids = _sel_clust_df["cluster_id"].tolist()
+                            _scatter_pick = st.selectbox(
+                                "Inspect one selected cluster",
+                                _sel_clust_ids,
+                                key="scatter_inspect_pick",
+                            )
+                            if _scatter_pick is not None:
+                                st.session_state["_scatter_inspect_cluster"] = int(_scatter_pick)
+                        else:
+                            st.caption(
+                                "Use box or lasso select on the scatter plot to inspect overlapping clusters."
+                            )
+                            st.session_state.pop("_scatter_inspect_cluster", None)
+                    else:
+                        st.caption(
+                            "Use box or lasso select on the scatter plot to inspect overlapping clusters."
+                        )
+                        st.session_state.pop("_scatter_inspect_cluster", None)
+
+                    fig_mix_r = px.scatter(
+                        smix,
+                        x="n_recordings",
+                        y="recording_purity",
+                        size="marker_n",
+                        color="recording_purity",
+                        color_continuous_scale="Plasma",
+                        hover_name="cluster_id",
+                        hover_data=[
+                            "n_frames",
+                            "dominant_recording",
+                            "n_wav",
+                            "wav_purity",
+                            "dominant_wav",
+                        ],
+                        custom_data=_scatter_meta_cols,
+                        labels={
+                            "n_recordings": "Parent recordings (merged segments)",
+                            "recording_purity": "Recording purity (1 = one recording dominates)",
+                        },
+                        title="Recording-level diversity (segment windows merged)",
+                    )
+                    fig_mix_r.update_layout(
+                        template=_mix_tmpl,
+                        height=420,
+                        xaxis=dict(rangemode="tozero"),
+                        yaxis=dict(range=[-0.05, 1.05]),
+                        dragmode="select",
+                    )
+                    fig_mix_r.update_traces(marker=dict(line=dict(width=0.6, color="rgba(255,255,255,0.35)"), opacity=0.9))
+                    _scatter_event_r = st.plotly_chart(
+                        fig_mix_r, use_container_width=True,
+                        on_select="rerun", key="scatter_sel_rec",
+                    )
+
+                    _sel_pts_r: list = []
+                    if _scatter_event_r is not None:
+                        _sel_obj_r = getattr(_scatter_event_r, "selection", None)
+                        if _sel_obj_r is not None:
+                            _sel_pts_r = getattr(_sel_obj_r, "points", []) or []
+
+                    if _sel_pts_r:
+                        _sel_rows_r: List[Dict] = []
+                        for _pt_r in _sel_pts_r:
+                            _cd_r = (
+                                _pt_r.get("customdata")
+                                if isinstance(_pt_r, dict)
+                                else getattr(_pt_r, "customdata", None)
+                            )
+                            if _cd_r is not None and len(_cd_r) >= len(_scatter_meta_cols):
+                                _sel_rows_r.append(dict(zip(_scatter_meta_cols, _cd_r)))
+                        if _sel_rows_r:
+                            _sel_clust_df_r = pd.DataFrame(_sel_rows_r)
+                            for _ic in ("cluster_id", "n_frames", "n_wav", "n_recordings"):
+                                if _ic in _sel_clust_df_r.columns:
+                                    _sel_clust_df_r[_ic] = (
+                                        pd.to_numeric(_sel_clust_df_r[_ic], errors="coerce")
+                                        .fillna(0)
+                                        .astype(int)
+                                    )
+                            for _fc in ("class_purity", "wav_purity", "recording_purity"):
+                                if _fc in _sel_clust_df_r.columns:
+                                    _sel_clust_df_r[_fc] = (
+                                        pd.to_numeric(_sel_clust_df_r[_fc], errors="coerce")
+                                        .astype(float)
+                                        .round(3)
+                                    )
+                            _sel_clust_df_r = _sel_clust_df_r.drop_duplicates(subset=["cluster_id"])
+                            if _HAS_MPL:
+                                pies_class_r: List[Optional[str]] = []
+                                pies_wav_r: List[Optional[str]] = []
+                                for _cid in _sel_clust_df_r["cluster_id"].tolist():
+                                    _uri_class, _ = _cluster_pie_for_distribution(
+                                        work_global,
+                                        int(_cid),
+                                        basis="class_name",
+                                        top_k=5,
+                                    )
+                                    _uri_wav, _ = _cluster_pie_for_distribution(
+                                        work_global,
+                                        int(_cid),
+                                        basis="wav",
+                                        top_k=5,
+                                    )
+                                    pies_class_r.append(_uri_class)
+                                    pies_wav_r.append(_uri_wav)
+                                _sel_clust_df_r["pie_class"] = pies_class_r
+                                _sel_clust_df_r["pie_wav"] = pies_wav_r
+                            st.caption(f"**{len(_sel_clust_df_r)}** cluster(s) selected via box / lasso.")
+                            _sel_col_cfg_r = {
+                                "wav_purity": st.column_config.ProgressColumn(
+                                    "wav purity", format="%.2f", min_value=0.0, max_value=1.0,
+                                ),
+                                "recording_purity": st.column_config.ProgressColumn(
+                                    "rec. purity", format="%.2f", min_value=0.0, max_value=1.0,
+                                ),
+                                "class_purity": st.column_config.ProgressColumn(
+                                    "class purity", format="%.2f", min_value=0.0, max_value=1.0,
+                                ),
+                            }
+                            if "pie_class" in _sel_clust_df_r.columns:
+                                _sel_col_cfg_r["pie_class"] = st.column_config.ImageColumn(
+                                    "class pie",
+                                    help="Within-cluster label distribution (`class_name`).",
+                                    width="small",
+                                )
+                            if "pie_wav" in _sel_clust_df_r.columns:
+                                _sel_col_cfg_r["pie_wav"] = st.column_config.ImageColumn(
+                                    "wav pie",
+                                    help="Within-cluster wav-file distribution (`wav`).",
+                                    width="small",
+                                )
+                            st.dataframe(
+                                _sel_clust_df_r,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config=_sel_col_cfg_r,
+                            )
+                            _sel_clust_ids_r = _sel_clust_df_r["cluster_id"].tolist()
+                            _scatter_pick_r = st.selectbox(
+                                "Inspect one selected cluster",
+                                _sel_clust_ids_r,
+                                key="scatter_inspect_pick_rec",
+                            )
+                            if _scatter_pick_r is not None:
+                                st.session_state["_scatter_inspect_cluster_rec"] = int(_scatter_pick_r)
+                        else:
+                            st.caption(
+                                "Use box or lasso select on the recording scatter to inspect overlapping clusters."
+                            )
+                            st.session_state.pop("_scatter_inspect_cluster_rec", None)
+                    else:
+                        st.caption(
+                            "Use box or lasso select on the recording scatter to inspect overlapping clusters."
+                        )
+                        st.session_state.pop("_scatter_inspect_cluster_rec", None)
+
+                    st.subheader("Cluster summary (sortable)")
+                    summ_show = summ.head(min(300, len(summ))).copy()
+                    for _col in ("wav_purity", "recording_purity", "class_purity"):
+                        if _col in summ_show.columns:
+                            summ_show[_col] = summ_show[_col].astype(float).round(3)
+                    _col_cfg: Dict = {}
+                    if "wav_purity" in summ_show.columns:
+                        _col_cfg["wav_purity"] = st.column_config.ProgressColumn(
+                            "wav purity",
+                            help="1.0 = almost all frames from one .wav file",
+                            format="%.2f",
+                            min_value=0.0,
+                            max_value=1.0,
+                        )
+                    if "recording_purity" in summ_show.columns:
+                        _col_cfg["recording_purity"] = st.column_config.ProgressColumn(
+                            "rec. purity",
+                            help="1.0 = almost all frames from one parent recording (segments merged)",
+                            format="%.2f",
+                            min_value=0.0,
+                            max_value=1.0,
+                        )
+                    if "class_purity" in summ_show.columns:
+                        _col_cfg["class_purity"] = st.column_config.ProgressColumn(
+                            "class purity",
+                            help="1.0 = almost all labeled frames share one class (needs CSV labels)",
+                            format="%.2f",
+                            min_value=0.0,
+                            max_value=1.0,
+                        )
+                    if "n_wav" in summ_show.columns:
+                        _col_cfg["n_wav"] = st.column_config.NumberColumn(
+                            "n_wav",
+                            help="Distinct .wav basenames in this cluster",
+                            format="%d",
+                        )
+                    if "n_recordings" in summ_show.columns:
+                        _col_cfg["n_recordings"] = st.column_config.NumberColumn(
+                            "n_rec",
+                            help="Distinct parent recordings (segment windows folded)",
+                            format="%d",
+                        )
+                    _df_kw: Dict = dict(use_container_width=True, hide_index=True)
+                    if _col_cfg:
+                        _df_kw["column_config"] = _col_cfg
+                    st.dataframe(summ_show, **_df_kw)
+
+                with st.expander("Inspect one cluster: which `.wav` files & recordings?", expanded=True):
+                    if len(summ) == 0 or len(work_global) == 0:
+                        st.warning("No data to inspect.")
+                    else:
+                        opt_ids = summ.sort_values("n_frames", ascending=False)["cluster_id"].tolist()
+
+                        _scatter_cid = (
+                            st.session_state.get("_scatter_inspect_cluster")
+                            or st.session_state.get("_scatter_inspect_cluster_rec")
+                        )
+                        if _scatter_cid is not None and int(_scatter_cid) in opt_ids:
+                            st.session_state["global_inspect_cluster_id"] = int(_scatter_cid)
+
+                        def _fmt_cl_opt(cid: int) -> str:
+                            r = summ.loc[summ["cluster_id"] == int(cid)].iloc[0]
+                            return (
+                                f"{cid}  |  {int(r['n_frames'])} frames  |  "
+                                f"{int(r['n_wav'])} wavs  |  {int(r['n_recordings'])} recordings  |  "
+                                f"wav_purity={float(r['wav_purity']):.2f}"
+                            )
+
+                        pick_c = st.selectbox(
+                            "Choose cluster",
+                            opt_ids,
+                            format_func=_fmt_cl_opt,
+                            key="global_inspect_cluster_id",
+                        )
+                        sub_i = work_global[work_global["cluster_id"] == int(pick_c)].copy()
+                        st.caption(
+                            f"**{len(sub_i)}** frames in cluster **{pick_c}**. "
+                            "Tables show where those frames came from."
+                        )
+                        wv = sub_i["wav"].astype(str).value_counts().reset_index()
+                        wv.columns = ["wav", "frames"]
+                        wv["pct_of_cluster"] = (100.0 * wv["frames"] / max(len(sub_i), 1)).round(1)
+                        st.markdown("**By wav filename** (exact file)")
+                        st.dataframe(wv.head(40), use_container_width=True, hide_index=True)
+
+                        sub_i["_recording_id"] = sub_i["wav"].map(_recording_group_id)
+                        rv = sub_i["_recording_id"].astype(str).value_counts().reset_index()
+                        rv.columns = ["recording_id", "frames"]
+                        rv["pct_of_cluster"] = (100.0 * rv["frames"] / max(len(sub_i), 1)).round(1)
+                        st.markdown(
+                            "**By parent recording** (segment windows merged; same id = same underlying recording)"
+                        )
+                        st.dataframe(rv.head(40), use_container_width=True, hide_index=True)
+
+                df_hm = work_global[work_global["cluster_id"].isin(vc_top.index)].copy()
+                has_lbl = "class_name" in df_hm.columns and bool(
+                    (df_hm["class_name"].astype(str).str.lower() != "unknown").any()
+                )
+                if has_lbl and len(df_hm) > 0:
+                    ct = pd.crosstab(df_hm["cluster_id"], df_hm["class_name"], normalize="index")
+                    ct = ct.reindex(vc_top.index, fill_value=0.0)
+                    z = ct.to_numpy(dtype=np.float64)
+                    # Prefix y labels so Plotly never treats cluster_id as a numeric axis (avoids huge empty gaps).
+                    y_labels = [f"c{i}" for i in ct.index.tolist()]
+                    x_labels = [str(c) for c in ct.columns.tolist()]
+                    rids = ct.index.to_numpy()
+                    cols_a = ct.columns.to_numpy()
+                    hovertext = [
+                        [
+                            f"cluster_id={rids[i]}<br>class={cols_a[j]!s}<br>P(class|cluster)={z[i, j]:.4f}"
+                            for j in range(z.shape[1])
+                        ]
+                        for i in range(z.shape[0])
+                    ]
+                    _hm_template = "plotly_dark" if st.session_state.get("dark_mode", True) else "plotly_white"
+                    fig_hm = go.Figure(
+                        data=go.Heatmap(
+                            z=z,
+                            x=x_labels,
+                            y=y_labels,
+                            hovertext=hovertext,
+                            # Low P -> dark; high P -> bright. Avoid "Blues" (0=white on dark Streamlit).
+                            colorscale="Viridis",
+                            zmin=0.0,
+                            zmax=1.0,
+                            colorbar=dict(title="P(class|cluster)", tickformat=".2f"),
+                            hovertemplate="%{hovertext}<extra></extra>",
+                        )
+                    )
+                    nrows = len(ct.index)
+                    fig_hm.update_layout(
+                        template=_hm_template,
+                        title="Class mixture within top clusters (row-normalized)",
+                        xaxis_title="class_name",
+                        yaxis_title="cluster_id",
+                        height=int(max(400, min(1000, 18 * nrows + 120))),
+                        margin=dict(l=88, r=24, t=48, b=max(140, min(360, 6 * len(x_labels) + 80))),
+                        yaxis=dict(type="category", categoryorder="array", categoryarray=y_labels, autorange="reversed"),
+                        xaxis=dict(type="category", tickangle=-55, tickfont=dict(size=9)),
+                    )
+                    st.plotly_chart(fig_hm, use_container_width=True)
+                elif len(df_hm) > 0:
+                    st.info("No non-Unknown labels in selection; class heatmap skipped.")
+
+                # Recording mixture (parent ids): same-file vs mixed clusters
+                df_rec_hm = work_global[work_global["cluster_id"].isin(vc_top.index)].copy()
+                if len(df_rec_hm) > 0:
+                    rec_counts_all = df_rec_hm["wav"].map(_recording_group_id).value_counts()
+                    top_recs = rec_counts_all.head(int(rec_hm_top)).index.tolist()
+                    df_rec_hm["recording_id"] = df_rec_hm["wav"].map(_recording_group_id)
+                    df_rec_hm = df_rec_hm[df_rec_hm["recording_id"].isin(top_recs)]
+                    if len(df_rec_hm) > 0 and len(top_recs) > 0:
+                        ct_rec = pd.crosstab(
+                            df_rec_hm["cluster_id"],
+                            df_rec_hm["recording_id"],
+                            normalize="index",
+                        )
+                        ct_rec = ct_rec.reindex(vc_top.index, fill_value=0.0)
+                        ct_rec = ct_rec.reindex(columns=top_recs, fill_value=0.0)
+                        zr = ct_rec.to_numpy(dtype=np.float64)
+                        y_labels_r = [f"c{i}" for i in ct_rec.index.tolist()]
+                        x_labels_r = [str(c) for c in ct_rec.columns.tolist()]
+                        rids_r = ct_rec.index.to_numpy()
+                        cols_r = ct_rec.columns.to_numpy()
+                        hover_r = [
+                            [
+                                f"cluster_id={rids_r[i]}<br>recording={cols_r[j]!s}<br>P(rec|cluster)={zr[i, j]:.4f}"
+                                for j in range(zr.shape[1])
+                            ]
+                            for i in range(zr.shape[0])
+                        ]
+                        _hm_tmpl_r = "plotly_dark" if st.session_state.get("dark_mode", True) else "plotly_white"
+                        fig_hm_r = go.Figure(
+                            data=go.Heatmap(
+                                z=zr,
+                                x=x_labels_r,
+                                y=y_labels_r,
+                                hovertext=hover_r,
+                                colorscale="Viridis",
+                                zmin=0.0,
+                                zmax=1.0,
+                                colorbar=dict(title="P(rec|cluster)", tickformat=".2f"),
+                                hovertemplate="%{hovertext}<extra></extra>",
+                            )
+                        )
+                        nr_r = len(ct_rec.index)
+                        fig_hm_r.update_layout(
+                            template=_hm_tmpl_r,
+                            title="Recording mixture within top clusters (row-normalized; segment windows merged)",
+                            xaxis_title="parent recording id",
+                            yaxis_title="cluster_id",
+                            height=int(max(400, min(1000, 18 * nr_r + 120))),
+                            margin=dict(
+                                l=88,
+                                r=24,
+                                t=48,
+                                b=max(140, min(400, 7 * len(x_labels_r) + 80)),
+                            ),
+                            yaxis=dict(
+                                type="category",
+                                categoryorder="array",
+                                categoryarray=y_labels_r,
+                                autorange="reversed",
+                            ),
+                            xaxis=dict(type="category", tickangle=-55, tickfont=dict(size=8)),
+                        )
+                        st.plotly_chart(fig_hm_r, use_container_width=True)
+
+                if not _HAS_UMAP:
+                    st.warning("Install `umap-learn` for UMAP plots: `pip install umap-learn`")
+                elif not _dataframe_has_usable_embeddings(work_global):
+                    st.info(
+                        "Frame/centroid UMAP skipped (no `embedding_vec` column). "
+                        "Re-run clustering in Tab 2 to keep embeddings in session."
+                    )
+                else:
+                    assert umap is not None
+                    n_take = min(int(umap_max_pts), len(work_global))
+                    sampled = (
+                        work_global.sample(n=n_take, random_state=42)
+                        if len(work_global) > n_take
+                        else work_global
+                    )
+                    Xs = np.stack(
+                        [np.asarray(v, dtype=np.float32) for v in sampled["embedding_vec"].to_numpy()]
+                    )
+                    if Xs.shape[0] < 5:
+                        st.info(
+                            f"Frame UMAP skipped: need at least 5 sampled points (have {Xs.shape[0]}). "
+                            "Load more frames or relax filters."
+                        )
+                    else:
+                        nn_pts = int(min(15, max(2, Xs.shape[0] - 1)))
+                        red = umap.UMAP(
+                            n_components=2,
+                            random_state=42,
+                            n_neighbors=nn_pts,
+                            min_dist=0.1,
+                            metric=str(umap_metric),
+                        )
+                        xy = red.fit_transform(Xs)
+                        plot_df = sampled.reset_index(drop=True).copy()
+                        plot_df["umap_x"] = xy[:, 0]
+                        plot_df["umap_y"] = xy[:, 1]
+                        if umap_color_by == "cluster_id":
+                            plot_df["__color__"] = plot_df["cluster_id"].astype(str)
+                        elif umap_color_by == "class_name":
+                            plot_df["__color__"] = plot_df["class_name"].astype(str)
+                        else:
+                            plot_df["__color__"] = plot_df["wav"].astype(str)
+                        hover_cols = ["cluster_id", "class_name", "wav", "time_s"]
+                        hover_cols = [c for c in hover_cols if c in plot_df.columns]
+                        fig_u = px.scatter(
+                            plot_df,
+                            x="umap_x",
+                            y="umap_y",
+                            color="__color__",
+                            hover_data=hover_cols,
+                            title=f"Frame-level UMAP (n={len(plot_df)}, metric={umap_metric})",
+                        )
+                        fig_u.update_layout(legend_title_text=umap_color_by)
+                        st.plotly_chart(fig_u, use_container_width=True)
+
+                    C, cnts, cids = _cluster_centroid_matrix(work_global, include_noise=g_include_noise)
+                    if C.shape[0] < 2:
+                        st.caption("Centroid UMAP needs at least two clusters in the current filter.")
+                    else:
+                        nn_c = int(min(15, max(2, C.shape[0] - 1)))
+                        red_c = umap.UMAP(
+                            n_components=2,
+                            random_state=42,
+                            n_neighbors=nn_c,
+                            min_dist=0.1,
+                            metric=str(umap_metric),
+                        )
+                        Z = red_c.fit_transform(C)
+                        cent_df = pd.DataFrame(
+                            {
+                                "umap_x": Z[:, 0],
+                                "umap_y": Z[:, 1],
+                                "cluster_id": cids,
+                                "n_frames": cnts.astype(int),
+                            }
+                        )
+                        if len(summ) > 0:
+                            m = summ.set_index("cluster_id")
+                            cent_df["dominant_class"] = [
+                                str(m.loc[int(cid), "dominant_class"])
+                                if int(cid) in m.index
+                                else "—"
+                                for cid in cent_df["cluster_id"]
+                            ]
+                            cent_df["class_purity"] = [
+                                float(m.loc[int(cid), "class_purity"])
+                                if int(cid) in m.index
+                                else float("nan")
+                                for cid in cent_df["cluster_id"]
+                            ]
+                            cent_df["dominant_wav"] = [
+                                str(m.loc[int(cid), "dominant_wav"])
+                                if int(cid) in m.index
+                                else "—"
+                                for cid in cent_df["cluster_id"]
+                            ]
+                            cent_df["n_wav"] = [
+                                int(m.loc[int(cid), "n_wav"])
+                                if int(cid) in m.index
+                                else 0
+                                for cid in cent_df["cluster_id"]
+                            ]
+                            cent_df["wav_purity"] = [
+                                float(m.loc[int(cid), "wav_purity"])
+                                if int(cid) in m.index
+                                else float("nan")
+                                for cid in cent_df["cluster_id"]
+                            ]
+                        else:
+                            cent_df["dominant_class"] = "—"
+                            cent_df["class_purity"] = float("nan")
+                            cent_df["dominant_wav"] = "—"
+                            cent_df["n_wav"] = 0
+                            cent_df["wav_purity"] = float("nan")
+                        max_sz = float(cent_df["n_frames"].max()) if len(cent_df) else 1.0
+                        cent_df["marker_size"] = 8.0 + 22.0 * (cent_df["n_frames"] / max(max_sz, 1.0))
+                        fig_c = px.scatter(
+                            cent_df,
+                            x="umap_x",
+                            y="umap_y",
+                            size="marker_size",
+                            color="dominant_class",
+                            hover_data=[
+                                "cluster_id",
+                                "n_frames",
+                                "n_wav",
+                                "wav_purity",
+                                "dominant_wav",
+                                "class_purity",
+                            ],
+                            title=f"Cluster-centroid UMAP (K={len(cent_df)}, metric={umap_metric})",
+                        )
+                        fig_c.update_layout(legend_title_text="dominant_class")
+                        st.plotly_chart(fig_c, use_container_width=True)
 
         with st.container(border=True):
             colX, colY, colZ = st.columns(3)
@@ -1223,6 +2438,8 @@ with tab3:
                                 z=S_db,
                                 x=t_axis,
                                 y=f_axis,
+                                colorscale="Magma",
+                                showscale=False,
                             )
                         )
 
@@ -1239,10 +2456,15 @@ with tab3:
                                 x=rel_t,
                                 line_width=2,
                                 line_dash="solid",
-                                line_color="cyan",
+                                line_color="rgba(180, 140, 255, 0.55)",
                             )
 
-                        fig.update_layout(height=260, margin=dict(l=0, r=0, t=0, b=0))
+                        fig.update_layout(
+                            height=260,
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            plot_bgcolor="rgb(20, 0, 30)",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                        )
                         st.plotly_chart(fig, use_container_width=True)
                     except Exception as e:
                         st.info(f"No spectrogram: {e}")
@@ -1353,6 +2575,8 @@ with tab3:
                                 z=S_db,
                                 x=t_axis,
                                 y=f_axis,
+                                colorscale="Magma",
+                                showscale=False,
                             )
                         )
 
@@ -1363,7 +2587,12 @@ with tab3:
                             line_width=0,
                         )
 
-                        fig.update_layout(height=260, margin=dict(l=0, r=0, t=0, b=0))
+                        fig.update_layout(
+                            height=260,
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            plot_bgcolor="rgb(20, 0, 30)",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                        )
                         st.plotly_chart(fig, use_container_width=True)
                     except Exception as e:
                         st.info(f"No spectrogram (segment too short / STFT issue): {e}")
