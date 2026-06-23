@@ -2,9 +2,16 @@
 # Copyright (c) Max Planck Institute of Animal Behavior
 #
 # Standalone vocal-region contrastive finetune for data2vec_multi checkpoints.
+#
+# Training recipe (self-supervised, not classification):
+#   - Student: pretrained data2vec_multi, updated by AdamW
+#   - Teacher: copy of same checkpoint, frozen (used only for anchor loss)
+#   - Data: Fairseq manifest (wav paths) + CSV vocal intervals
+#   - Forward: extract_features -> average top-K layer embeddings (B, T, D)
+#   - Loss: triplet margin on vocal vs non-vocal/cross-span frames + teacher anchor
+#   - Output: Fairseq .pt checkpoint compatible with animal2vec_inference.py
 
 import argparse
-import copy
 import logging
 import math
 import os
@@ -67,6 +74,7 @@ def parse_args():
 
 
 def get_lr(step: int, warmup: int, max_updates: int, peak_lr: float) -> float:
+    """Linear warmup, then cosine decay to zero."""
     if step < warmup:
         return peak_lr * (step + 1) / max(warmup, 1)
     progress = (step - warmup) / max(max_updates - warmup, 1)
@@ -74,10 +82,13 @@ def get_lr(step: int, warmup: int, max_updates: int, peak_lr: float) -> float:
 
 
 def load_models(pretrain_ckpt: str, device: str):
-    models, _cfg = checkpoint_utils.load_model_ensemble([pretrain_ckpt])
-    student = models[0].to(device)
+    """Load student (trainable) and teacher (frozen) from the same pretrain ckpt."""
+    # Fairseq models hold lazy task refs; deepcopy triggers RecursionError.
+    student_models, _cfg = checkpoint_utils.load_model_ensemble([pretrain_ckpt])
+    teacher_models, _ = checkpoint_utils.load_model_ensemble([pretrain_ckpt])
+    student = student_models[0].to(device)
     student.train()
-    teacher = copy.deepcopy(student)
+    teacher = teacher_models[0].to(device)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
@@ -105,6 +116,7 @@ def sample_rate_from_cfg(model) -> int:
 
 
 def freeze_feature_extractor(model):
+    """Optional: train only the shared transformer, not the CNN front-end."""
     enc = model.modality_encoders.get("AUDIO")
     if enc is None:
         return
@@ -116,6 +128,7 @@ def freeze_feature_extractor(model):
 
 
 def save_fairseq_checkpoint(path: str, student, pretrain_ckpt: str, num_updates: int):
+    """Overwrite model weights in a Fairseq checkpoint; keep cfg/task for inference."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     state = torch.load(pretrain_ckpt, map_location="cpu")
     state["model"] = student.state_dict()
@@ -136,6 +149,7 @@ def train(args):
         device = "cpu"
         logger.warning("CUDA unavailable; using CPU")
 
+    # --- Models: student learns, teacher stays at pretrain weights ---
     student, teacher = load_models(args.pretrain_ckpt, device)
     if args.freeze_feature_extractor:
         freeze_feature_extractor(student)
@@ -144,6 +158,7 @@ def train(args):
     sample_rate = sample_rate_from_cfg(student)
     logger.info("sample_rate=%s conv_layers=%s", sample_rate, conv_layers)
 
+    # --- Data: manifest wavs + CSV vocal intervals -> encoder-frame triplets ---
     label_cfg = LabelConfig(
         label_csv_dir=args.label_csv_dir,
         label_csv_format=args.label_csv_format,
@@ -177,6 +192,7 @@ def train(args):
     rng = np.random.default_rng(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # --- Training loop: fixed number of optimizer steps (not epochs) ---
     step = 0
     data_iter = iter(loader)
     while step < args.max_updates:
@@ -198,15 +214,17 @@ def train(args):
         mixup_saved = getattr(student.cfg, "source_mixup", -1)
         student.cfg.source_mixup = -1
 
-        student_out = student.extract_features(source=source, mask=False, features_only=True)
+        # Frame embeddings: (B, T, D) from top-K averaged transformer layers
+        student_out = student.extract_features(source=source, mask=False)
         s_emb = average_layer_embeddings(student, student_out["layer_results"], args.average_top_k_layers)
 
         with torch.no_grad():
-            teacher_out = teacher.extract_features(source=source, mask=False, features_only=True)
+            teacher_out = teacher.extract_features(source=source, mask=False)
             t_emb = average_layer_embeddings(teacher, teacher_out["layer_results"], args.average_top_k_layers)
 
         student.cfg.source_mixup = mixup_saved
 
+        # Triplet + teacher-anchor loss; skip step if no valid triplets in batch
         loss, stats = compute_contrastive_loss(
             s_emb,
             t_emb,
@@ -227,6 +245,7 @@ def train(args):
         step += 1
 
         if step % args.log_interval == 0:
+            # Healthy training: pos_dist < neg_dist, loss_triplet decreasing
             logger.info(
                 "update=%d loss=%.4f triplet=%.4f anchor=%.4f pos=%.4f neg=%.4f triplets=%d lr=%.2e",
                 step,

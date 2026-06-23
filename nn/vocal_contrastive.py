@@ -1,6 +1,16 @@
 # Copyright (c) Max Planck Institute of Animal Behavior
 #
 # Vocal-region contrastive finetune: dataset, CSV parsing, triplet loss.
+#
+# Overview (for code review):
+#   1. CSV labels define vocalization time intervals; class names are only used
+#      to filter out Empty/Unknown/silence rows — we do NOT train a classifier.
+#   2. Intervals are mapped from wav samples -> encoder frame indices (one frame
+#      per CNN+transformer time step) so triplets are sampled in embedding space.
+#   3. Loss = triplet margin on cosine distance + small teacher-anchor term:
+#        - anchor / positive: two random frames from the SAME vocal span
+#        - negative: non-vocal frame, different span, or different file in batch
+#        - anchor term: keep student embeddings close to frozen teacher (pretrain)
 
 import logging
 import os
@@ -197,7 +207,11 @@ def read_vocal_intervals_seconds(
     segment_offset_s: float = 0.0,
     clip_dur_s: Optional[float] = None,
 ) -> List[Tuple[float, float]]:
-    """Return clip-local half-open vocal intervals [start, end) in seconds."""
+    """Return clip-local half-open vocal intervals [start, end) in seconds.
+
+    Supports NIPS index CSVs, start+duration seconds, and Audacity exports.
+    Rows labeled Empty/Unknown (by name or NIPS class id) are dropped.
+    """
     if not os.path.isfile(csv_path):
         return []
 
@@ -285,7 +299,10 @@ def read_vocal_intervals_seconds(
 
 
 def parse_segment_offset_seconds(wav_stem: str) -> Tuple[str, float]:
-    """Parse foo_00000s_00005s -> (recording_stem, offset_s)."""
+    """Parse foo_00000s_00005s -> (recording_stem, offset_s).
+
+    Segment wavs share one CSV keyed by recording stem; offset shifts intervals.
+    """
     m = _SEGMENT_WINDOW_RE.search(wav_stem)
     if not m:
         return wav_stem, 0.0
@@ -334,7 +351,11 @@ def intervals_to_encoder_frame_lists(
     sample_rate: float,
     conv_feature_layers: List[Tuple[int, int, int]],
 ) -> Tuple[List[List[int]], List[int]]:
-    """Map vocal intervals to encoder frame indices; also return non-vocal frames."""
+    """Map vocal intervals to encoder frame indices; also return non-vocal frames.
+
+    Each vocal span needs >= 2 encoder frames so we can sample anchor+positive
+    from the same span. Linear interpolation approximates the CNN downsampling.
+    """
     t_enc = encoder_output_length(wav_len, conv_feature_layers)
     if t_enc <= 0:
         return [], list(range(max(t_enc, 0)))
@@ -384,6 +405,11 @@ def normalize_audio(feats: torch.Tensor) -> torch.Tensor:
 
 
 class VocalContrastiveDataset(Dataset):
+    """Fairseq manifest + per-recording CSV -> wav tensor + encoder-frame spans.
+
+    Skips clips with no CSV, no vocal intervals after filtering, or missing wav.
+    """
+
     def __init__(
         self,
         manifest_path: str,
@@ -492,7 +518,11 @@ class VocalContrastiveDataset(Dataset):
 
 
 def make_collate_fn(sample_rate: int, conv_feature_layers: List[Tuple[int, int, int]]):
-    """Build collate_fn that re-maps vocal spans to the cropped batch audio length."""
+    """Build collate_fn that re-maps vocal spans to the cropped batch audio length.
+
+    Clips in a batch are truncated to the shortest length; vocal spans are
+    recomputed on the cropped audio so frame indices match the forward pass.
+    """
 
     def collate_vocal_contrastive(samples):
         samples = [s for s in samples if s.get("source") is not None]
@@ -528,7 +558,11 @@ def make_collate_fn(sample_rate: int, conv_feature_layers: List[Tuple[int, int, 
 
 
 def average_layer_embeddings(model, layer_results, average_top_k_layers: int) -> torch.Tensor:
-    """Return (B, T, D) averaged over top-K transformer layers."""
+    """Return (B, T, D) frame embeddings averaged over the top-K transformer layers.
+
+    Matches animal2vec_inference: use the last K layer outputs (pretrain vs
+    finetuned checkpoints differ slightly in layer_results structure).
+    """
     finetuned = hasattr(model, "w2v_encoder")
     if finetuned:
         target = [l[0] for l in layer_results[-average_top_k_layers:]]
@@ -544,18 +578,28 @@ def sample_negative_frame(
     non_vocal_enc: List[List[int]],
     rng: np.random.Generator,
 ) -> int:
-    """Pick negative encoder frame; never from the same vocalization span as the anchor."""
+    """Pick negative encoder frame; never from the same vocalization span as the anchor.
+
+    Roughly equal random choice among:
+      (0) non-vocal frame in the same clip
+      (1) vocal frame from a different span in the same clip
+      (2) vocal frame from a different clip in the batch
+  Fallbacks ensure a negative is always found when possible.
+    """
     b = batch_idx
     choice = rng.integers(0, 3)
 
+    # Prefer non-vocal silence/background within the same recording.
     if choice == 0 and non_vocal_enc[b]:
         return int(rng.choice(non_vocal_enc[b]))
 
     other_span_indices = [i for i in range(len(vocal_spans_enc[b])) if i != anchor_span_idx]
+    # Different vocalization in the same clip (e.g. two bird calls).
     if choice == 1 and other_span_indices:
         si = int(rng.choice(other_span_indices))
         return int(rng.choice(vocal_spans_enc[b][si]))
 
+    # Vocal frame from a different recording in the same batch.
     other = [j for j in range(len(vocal_spans_enc)) if j != b and vocal_spans_enc[j]]
     if other:
         j = int(rng.choice(other))
@@ -584,8 +628,16 @@ def compute_contrastive_loss(
     rng: Optional[np.random.Generator] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """
+    Contrastive loss on frame embeddings.
+
+    Per batch item with at least one vocal span:
+      - Pick one span, then two distinct frames -> anchor (e) and positive (e1)
+      - Sample negative frame e2 via sample_negative_frame()
+      - Triplet: max(0, d(anchor,pos) - d(anchor,neg) + margin) on cosine distance
+      - Anchor: mean cosine distance student vs frozen teacher at e, e1, e2
+
     student_emb, teacher_emb: (B, T, D)
-    Returns scalar loss and logging dict.
+    Returns scalar loss and logging dict (pos_dist, neg_dist, valid_triplets, ...).
     """
     rng = rng or np.random.default_rng()
     bsz, t_enc, _ = student_emb.shape
@@ -593,6 +645,7 @@ def compute_contrastive_loss(
     anchors, positives, negatives = [], [], []
     t_anchors, t_positives, t_negatives = [], [], []
 
+    # One triplet per clip in the batch (when spans are long enough).
     for b in range(bsz):
         spans = vocal_spans_enc[b]
         if not spans:
@@ -620,10 +673,12 @@ def compute_contrastive_loss(
     p = F.normalize(torch.stack(positives), dim=-1)
     n = F.normalize(torch.stack(negatives), dim=-1)
 
+    # Cosine distance = 1 - cosine_similarity; pull pos closer, push neg farther.
     d_pos = 1.0 - (a * p).sum(dim=-1)
     d_neg = 1.0 - (a * n).sum(dim=-1)
     loss_triplet = F.relu(d_pos - d_neg + margin).mean()
 
+    # Teacher anchor: penalize drift from pretrained representations.
     ta = F.normalize(torch.stack(t_anchors), dim=-1)
     tp = F.normalize(torch.stack(t_positives), dim=-1)
     tn = F.normalize(torch.stack(t_negatives), dim=-1)
