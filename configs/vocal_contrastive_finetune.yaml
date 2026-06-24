@@ -22,3 +22,4 @@ save_interval_updates: 1000
 log_interval: 50
 normalize: true
 freeze_feature_extractor: false
+# class_aware: false  # CLI: --class-aware for same-class pos / diff-class neg diagnostic

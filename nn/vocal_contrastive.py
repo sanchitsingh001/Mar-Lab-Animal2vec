@@ -17,7 +17,9 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
+
+ClassKey = Union[int, str]
 
 import numpy as np
 import torch
@@ -105,6 +107,14 @@ def _label_from_field(field: str) -> Tuple[Optional[str], Optional[int]]:
 
 def _normalize_class_name(name: str) -> str:
     return name.strip().lower()
+
+
+def _class_key_from_label(label_name: Optional[str], class_id: Optional[int]) -> ClassKey:
+    if class_id is not None:
+        return class_id
+    if label_name:
+        return _normalize_class_name(label_name.split()[0])
+    return "unknown"
 
 
 def _build_exclude_sets(exclude_classes: Optional[Sequence[str]]):
@@ -206,11 +216,12 @@ def read_vocal_intervals_seconds(
     true_dur_s: Optional[float] = None,
     segment_offset_s: float = 0.0,
     clip_dur_s: Optional[float] = None,
-) -> List[Tuple[float, float]]:
-    """Return clip-local half-open vocal intervals [start, end) in seconds.
+) -> List[Tuple[float, float, ClassKey]]:
+    """Return clip-local half-open vocal intervals [start, end, class_key) in seconds.
 
     Supports NIPS index CSVs, start+duration seconds, and Audacity exports.
     Rows labeled Empty/Unknown (by name or NIPS class id) are dropped.
+    class_key is NIPS class_id when present, else normalized label name.
     """
     if not os.path.isfile(csv_path):
         return []
@@ -227,7 +238,7 @@ def read_vocal_intervals_seconds(
     )
     exclude_names, exclude_ids = _build_exclude_sets(cfg.exclude_classes)
 
-    intervals: List[Tuple[float, float]] = []
+    intervals: List[Tuple[float, float, ClassKey]] = []
     skip_header = fmt == "audacity"
 
     for line in raw_lines:
@@ -274,25 +285,25 @@ def read_vocal_intervals_seconds(
             continue
         if _row_is_excluded(label_name, class_id, exclude_names, exclude_ids):
             continue
-        intervals.append((start_s, end_s))
+        intervals.append((start_s, end_s, _class_key_from_label(label_name, class_id)))
 
     intervals.sort(key=lambda x: x[0])
 
     # Shift recording-level CSV to segment-local time.
     if segment_offset_s > 0:
         intervals = [
-            (s - segment_offset_s, e - segment_offset_s)
-            for s, e in intervals
+            (s - segment_offset_s, e - segment_offset_s, ck)
+            for s, e, ck in intervals
             if e > segment_offset_s and s < (clip_dur_s or float("inf")) + segment_offset_s
         ]
 
     if clip_dur_s is not None:
         out = []
-        for s, e in intervals:
+        for s, e, ck in intervals:
             s = max(0.0, s)
             e = min(float(clip_dur_s), e)
             if e > s:
-                out.append((s, e))
+                out.append((s, e, ck))
         intervals = out
 
     return intervals
@@ -346,27 +357,31 @@ def encoder_output_length(num_audio_samples: int, conv_feature_layers: List[Tupl
 
 
 def intervals_to_encoder_frame_lists(
-    intervals_s: List[Tuple[float, float]],
+    intervals_s: Sequence[Tuple],
     wav_len: int,
     sample_rate: float,
     conv_feature_layers: List[Tuple[int, int, int]],
-) -> Tuple[List[List[int]], List[int]]:
+) -> Tuple[List[List[int]], List[int], List[ClassKey]]:
     """Map vocal intervals to encoder frame indices; also return non-vocal frames.
 
     Each vocal span needs >= 2 encoder frames so we can sample anchor+positive
     from the same span. Linear interpolation approximates the CNN downsampling.
+    Accepts (start, end) or (start, end, class_key) interval tuples.
     """
     t_enc = encoder_output_length(wav_len, conv_feature_layers)
     if t_enc <= 0:
-        return [], list(range(max(t_enc, 0)))
+        return [], list(range(max(t_enc, 0))), []
 
     wav_idx = np.arange(wav_len, dtype=np.float64)
     enc_idx = np.linspace(0, wav_len, t_enc, endpoint=False)
 
     vocal_spans_enc: List[List[int]] = []
+    vocal_span_classes: List[ClassKey] = []
     vocal_mask = np.zeros(t_enc, dtype=bool)
 
-    for start_s, end_s in intervals_s:
+    for interval in intervals_s:
+        start_s, end_s = interval[0], interval[1]
+        class_key = interval[2] if len(interval) >= 3 else "unknown"
         s_sample = int(np.floor(start_s * sample_rate))
         e_sample = int(np.ceil(end_s * sample_rate))
         s_sample = max(0, min(s_sample, wav_len - 1))
@@ -379,10 +394,11 @@ def intervals_to_encoder_frame_lists(
         frames = np.where(span_enc)[0].tolist()
         if len(frames) >= 2:
             vocal_spans_enc.append(frames)
+            vocal_span_classes.append(class_key)
             vocal_mask[span_enc] = True
 
     non_vocal_enc = np.where(~vocal_mask)[0].tolist()
-    return vocal_spans_enc, non_vocal_enc
+    return vocal_spans_enc, non_vocal_enc, vocal_span_classes
 
 
 def load_wav_mono(path: str, target_sr: int) -> torch.Tensor:
@@ -495,16 +511,16 @@ class VocalContrastiveDataset(Dataset):
             feats = feats[start : start + self.max_sample_size]
             # Shift interval times when random crop is applied (rare; off by default).
             intervals_s = [
-                (max(0.0, s - start / self.sample_rate), max(0.0, e - start / self.sample_rate))
-                for s, e in item["intervals_s"]
+                (max(0.0, s - start / self.sample_rate), max(0.0, e - start / self.sample_rate), ck)
+                for s, e, ck in item["intervals_s"]
             ]
             clip_dur_s = feats.numel() / self.sample_rate
-            intervals_s = [(s, min(e, clip_dur_s)) for s, e in intervals_s if e > s]
+            intervals_s = [(s, min(e, clip_dur_s), ck) for s, e, ck in intervals_s if e > s]
         else:
             intervals_s = item["intervals_s"]
 
         wav_len = feats.numel()
-        vocal_spans, non_vocal = intervals_to_encoder_frame_lists(
+        vocal_spans, non_vocal, span_classes = intervals_to_encoder_frame_lists(
             intervals_s, wav_len, self.sample_rate, self.conv_feature_layers
         )
 
@@ -514,6 +530,7 @@ class VocalContrastiveDataset(Dataset):
             "intervals_s": intervals_s,
             "vocal_spans_enc": vocal_spans,
             "non_vocal_enc": non_vocal,
+            "vocal_span_classes": span_classes,
         }
 
 
@@ -535,23 +552,26 @@ def make_collate_fn(sample_rate: int, conv_feature_layers: List[Tuple[int, int, 
 
         vocal_spans_enc = []
         non_vocal_enc = []
+        vocal_span_classes = []
         for s in samples:
             intervals = [
-                (max(0.0, st), min(en, clip_dur_s))
-                for st, en in s["intervals_s"]
+                (max(0.0, st), min(en, clip_dur_s), ck)
+                for st, en, ck in s["intervals_s"]
                 if en > st and st < clip_dur_s
             ]
-            spans, non_voc = intervals_to_encoder_frame_lists(
+            spans, non_voc, span_cls = intervals_to_encoder_frame_lists(
                 intervals, min_len, sample_rate, conv_feature_layers
             )
             vocal_spans_enc.append(spans)
             non_vocal_enc.append(non_voc)
+            vocal_span_classes.append(span_cls)
 
         return {
             "id": torch.LongTensor([s["id"] for s in samples]),
             "source": sources,
             "vocal_spans_enc": vocal_spans_enc,
             "non_vocal_enc": non_vocal_enc,
+            "vocal_span_classes": vocal_span_classes,
         }
 
     return collate_vocal_contrastive
@@ -618,6 +638,71 @@ def sample_negative_frame(
     return int(rng.choice(candidates)) if candidates else int(rng.choice(anchor_span))
 
 
+def sample_class_aware_positive(
+    batch_idx: int,
+    anchor_span_idx: int,
+    anchor_class: ClassKey,
+    vocal_spans_enc: List[List[List[int]]],
+    vocal_span_classes: List[List[ClassKey]],
+    rng: np.random.Generator,
+) -> Tuple[int, int, int, bool]:
+    """Return (batch_idx, frame_idx, pos_span_idx, used_same_class).
+
+    Prefer a vocal frame from a different span with the same class_key.
+  Fallback: two distinct frames from the anchor span.
+    """
+    b = batch_idx
+    anchor_span = vocal_spans_enc[b][anchor_span_idx]
+    e_idx = int(rng.choice(anchor_span))
+
+    other_spans = [
+        (bb, si)
+        for bb in range(len(vocal_spans_enc))
+        for si, cls in enumerate(vocal_span_classes[bb])
+        if cls == anchor_class and vocal_spans_enc[bb][si] and (bb != b or si != anchor_span_idx)
+    ]
+    if other_spans:
+        bb, si = other_spans[int(rng.integers(0, len(other_spans)))]
+        e1_idx = int(rng.choice(vocal_spans_enc[bb][si]))
+        return bb, e1_idx, si, True
+
+    others = [i for i in anchor_span if i != e_idx]
+    if others:
+        return b, int(rng.choice(others)), anchor_span_idx, False
+    if len(anchor_span) >= 2:
+        e_idx, e1_idx = rng.choice(anchor_span, size=2, replace=False).tolist()
+        return b, e1_idx, anchor_span_idx, False
+    return b, e_idx, anchor_span_idx, False
+
+
+def sample_class_aware_negative(
+    batch_idx: int,
+    anchor_span_idx: int,
+    anchor_class: ClassKey,
+    vocal_spans_enc: List[List[List[int]]],
+    vocal_span_classes: List[List[ClassKey]],
+    non_vocal_enc: List[List[int]],
+    rng: np.random.Generator,
+) -> Tuple[int, int, bool]:
+    """Return (batch_idx, frame_idx, used_diff_class).
+
+    Prefer a vocal frame from a span with class_key != anchor_class.
+  Fallback: sample_negative_frame (non-vocal / other span / other file).
+    """
+    diff_spans = [
+        (bb, si)
+        for bb in range(len(vocal_spans_enc))
+        for si, cls in enumerate(vocal_span_classes[bb])
+        if cls != anchor_class and vocal_spans_enc[bb][si]
+    ]
+    if diff_spans:
+        bb, si = diff_spans[int(rng.integers(0, len(diff_spans)))]
+        return bb, int(rng.choice(vocal_spans_enc[bb][si])), True
+
+    frame = sample_negative_frame(batch_idx, anchor_span_idx, vocal_spans_enc, non_vocal_enc, rng)
+    return batch_idx, frame, False
+
+
 def compute_contrastive_loss(
     student_emb: torch.Tensor,
     teacher_emb: torch.Tensor,
@@ -626,6 +711,8 @@ def compute_contrastive_loss(
     margin: float = 0.2,
     anchor_weight: float = 0.1,
     rng: Optional[np.random.Generator] = None,
+    class_aware: bool = False,
+    vocal_span_classes: Optional[List[List[ClassKey]]] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Contrastive loss on frame embeddings.
@@ -644,6 +731,8 @@ def compute_contrastive_loss(
 
     anchors, positives, negatives = [], [], []
     t_anchors, t_positives, t_negatives = [], [], []
+    pos_same_class = 0
+    neg_diff_class = 0
 
     # One triplet per clip in the batch (when spans are long enough).
     for b in range(bsz):
@@ -654,16 +743,35 @@ def compute_contrastive_loss(
         span = spans[span_idx]
         if len(span) < 2:
             continue
-        e_idx, e1_idx = rng.choice(span, size=2, replace=False).tolist()
-        e2_idx = sample_negative_frame(b, span_idx, vocal_spans_enc, non_vocal_enc, rng)
+
+        if class_aware and vocal_span_classes is not None:
+            anchor_class = vocal_span_classes[b][span_idx]
+            e_idx = int(rng.choice(span))
+            pos_b, e1_idx, _pos_si, same_cls = sample_class_aware_positive(
+                b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, rng
+            )
+            neg_b, e2_idx, diff_cls = sample_class_aware_negative(
+                b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, non_vocal_enc, rng
+            )
+            if same_cls:
+                pos_same_class += 1
+            if diff_cls:
+                neg_diff_class += 1
+        else:
+            e_idx, e1_idx = rng.choice(span, size=2, replace=False).tolist()
+            e2_idx = sample_negative_frame(b, span_idx, vocal_spans_enc, non_vocal_enc, rng)
+            pos_b, neg_b = b, b
+
         e2_idx = min(max(0, e2_idx), t_enc - 1)
+        e1_idx = min(max(0, e1_idx), t_enc - 1)
+        e_idx = min(max(0, e_idx), t_enc - 1)
 
         anchors.append(student_emb[b, e_idx])
-        positives.append(student_emb[b, e1_idx])
-        negatives.append(student_emb[b, e2_idx])
+        positives.append(student_emb[pos_b, e1_idx])
+        negatives.append(student_emb[neg_b, e2_idx])
         t_anchors.append(teacher_emb[b, e_idx])
-        t_positives.append(teacher_emb[b, e1_idx])
-        t_negatives.append(teacher_emb[b, e2_idx])
+        t_positives.append(teacher_emb[pos_b, e1_idx])
+        t_negatives.append(teacher_emb[neg_b, e2_idx])
 
     if not anchors:
         zero = student_emb.new_zeros(())
@@ -696,4 +804,7 @@ def compute_contrastive_loss(
         "pos_dist": float(d_pos.mean().detach().cpu()),
         "neg_dist": float(d_neg.mean().detach().cpu()),
     }
+    if class_aware:
+        stats["pos_same_class"] = pos_same_class
+        stats["neg_diff_class"] = neg_diff_class
     return loss, stats

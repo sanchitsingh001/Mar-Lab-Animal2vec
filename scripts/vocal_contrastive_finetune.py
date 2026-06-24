@@ -70,6 +70,11 @@ def parse_args():
     p.add_argument("--normalize", action="store_true", default=True)
     p.add_argument("--no-normalize", action="store_false", dest="normalize")
     p.add_argument("--freeze-feature-extractor", action="store_true")
+    p.add_argument(
+        "--class-aware",
+        action="store_true",
+        help="Diagnostic: same-class positives / different-class negatives (uses CSV class_id)",
+    )
     return p.parse_args()
 
 
@@ -233,6 +238,8 @@ def train(args):
             margin=args.margin,
             anchor_weight=args.anchor_weight,
             rng=rng,
+            class_aware=args.class_aware,
+            vocal_span_classes=batch.get("vocal_span_classes"),
         )
 
         if stats["valid_triplets"] == 0:
@@ -246,17 +253,33 @@ def train(args):
 
         if step % args.log_interval == 0:
             # Healthy training: pos_dist < neg_dist, loss_triplet decreasing
-            logger.info(
-                "update=%d loss=%.4f triplet=%.4f anchor=%.4f pos=%.4f neg=%.4f triplets=%d lr=%.2e",
-                step,
-                float(loss.detach()),
-                stats["loss_triplet"],
-                stats["loss_anchor"],
-                stats["pos_dist"],
-                stats["neg_dist"],
-                stats["valid_triplets"],
-                lr,
-            )
+            if args.class_aware:
+                logger.info(
+                    "update=%d loss=%.4f triplet=%.4f anchor=%.4f pos=%.4f neg=%.4f "
+                    "triplets=%d pos_same_cls=%d neg_diff_cls=%d lr=%.2e",
+                    step,
+                    float(loss.detach()),
+                    stats["loss_triplet"],
+                    stats["loss_anchor"],
+                    stats["pos_dist"],
+                    stats["neg_dist"],
+                    stats["valid_triplets"],
+                    stats.get("pos_same_class", 0),
+                    stats.get("neg_diff_class", 0),
+                    lr,
+                )
+            else:
+                logger.info(
+                    "update=%d loss=%.4f triplet=%.4f anchor=%.4f pos=%.4f neg=%.4f triplets=%d lr=%.2e",
+                    step,
+                    float(loss.detach()),
+                    stats["loss_triplet"],
+                    stats["loss_anchor"],
+                    stats["pos_dist"],
+                    stats["neg_dist"],
+                    stats["valid_triplets"],
+                    lr,
+                )
 
         if step % args.save_interval_updates == 0 or step == args.max_updates:
             ckpt_path = os.path.join(args.save_dir, f"checkpoint_{step}.pt")
