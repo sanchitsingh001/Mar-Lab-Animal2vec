@@ -8,7 +8,7 @@
 #   2. Intervals are mapped from wav samples -> encoder frame indices (one frame
 #      per CNN+transformer time step) so triplets are sampled in embedding space.
 #   3. Loss = triplet margin on cosine distance + small teacher-anchor term:
-#        - anchor / positive: two random frames from the SAME vocal span
+#        - every frame in each vocal span is an anchor; positive from same span
 #        - negative: non-vocal frame, different span, or different file in batch
 #        - anchor term: keep student embeddings close to frozen teacher (pretrain)
 
@@ -645,15 +645,16 @@ def sample_class_aware_positive(
     vocal_spans_enc: List[List[List[int]]],
     vocal_span_classes: List[List[ClassKey]],
     rng: np.random.Generator,
+    anchor_frame_idx: Optional[int] = None,
 ) -> Tuple[int, int, int, bool]:
     """Return (batch_idx, frame_idx, pos_span_idx, used_same_class).
 
     Prefer a vocal frame from a different span with the same class_key.
-  Fallback: two distinct frames from the anchor span.
+  Fallback: another frame from the anchor span (distinct from anchor when possible).
     """
     b = batch_idx
     anchor_span = vocal_spans_enc[b][anchor_span_idx]
-    e_idx = int(rng.choice(anchor_span))
+    e_idx = anchor_frame_idx if anchor_frame_idx is not None else int(rng.choice(anchor_span))
 
     other_spans = [
         (bb, si)
@@ -717,9 +718,10 @@ def compute_contrastive_loss(
     """
     Contrastive loss on frame embeddings.
 
-    Per batch item with at least one vocal span:
-      - Pick one span, then two distinct frames -> anchor (e) and positive (e1)
-      - Sample negative frame e2 via sample_negative_frame()
+    One triplet per encoder frame in every vocal span (when span has >= 2 frames):
+      - anchor (e): each frame in the span
+      - positive (e1): another frame from the same span (or same-class span if class_aware)
+      - negative (e2): sample_negative_frame() or class-aware diff-class fallback
       - Triplet: max(0, d(anchor,pos) - d(anchor,neg) + margin) on cosine distance
       - Anchor: mean cosine distance student vs frozen teacher at e, e1, e2
 
@@ -734,44 +736,52 @@ def compute_contrastive_loss(
     pos_same_class = 0
     neg_diff_class = 0
 
-    # One triplet per clip in the batch (when spans are long enough).
     for b in range(bsz):
         spans = vocal_spans_enc[b]
         if not spans:
             continue
-        span_idx = int(rng.integers(0, len(spans)))
-        span = spans[span_idx]
-        if len(span) < 2:
-            continue
 
-        if class_aware and vocal_span_classes is not None:
-            anchor_class = vocal_span_classes[b][span_idx]
-            e_idx = int(rng.choice(span))
-            pos_b, e1_idx, _pos_si, same_cls = sample_class_aware_positive(
-                b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, rng
-            )
-            neg_b, e2_idx, diff_cls = sample_class_aware_negative(
-                b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, non_vocal_enc, rng
-            )
-            if same_cls:
-                pos_same_class += 1
-            if diff_cls:
-                neg_diff_class += 1
-        else:
-            e_idx, e1_idx = rng.choice(span, size=2, replace=False).tolist()
-            e2_idx = sample_negative_frame(b, span_idx, vocal_spans_enc, non_vocal_enc, rng)
-            pos_b, neg_b = b, b
+        for span_idx, span in enumerate(spans):
+            if len(span) < 2:
+                continue
 
-        e2_idx = min(max(0, e2_idx), t_enc - 1)
-        e1_idx = min(max(0, e1_idx), t_enc - 1)
-        e_idx = min(max(0, e_idx), t_enc - 1)
+            for e_idx in span:
+                if class_aware and vocal_span_classes is not None:
+                    anchor_class = vocal_span_classes[b][span_idx]
+                    pos_b, e1_idx, _pos_si, same_cls = sample_class_aware_positive(
+                        b,
+                        span_idx,
+                        anchor_class,
+                        vocal_spans_enc,
+                        vocal_span_classes,
+                        rng,
+                        anchor_frame_idx=e_idx,
+                    )
+                    neg_b, e2_idx, diff_cls = sample_class_aware_negative(
+                        b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, non_vocal_enc, rng
+                    )
+                    if same_cls:
+                        pos_same_class += 1
+                    if diff_cls:
+                        neg_diff_class += 1
+                else:
+                    others = [i for i in span if i != e_idx]
+                    if not others:
+                        continue
+                    e1_idx = int(rng.choice(others))
+                    e2_idx = sample_negative_frame(b, span_idx, vocal_spans_enc, non_vocal_enc, rng)
+                    pos_b, neg_b = b, b
 
-        anchors.append(student_emb[b, e_idx])
-        positives.append(student_emb[pos_b, e1_idx])
-        negatives.append(student_emb[neg_b, e2_idx])
-        t_anchors.append(teacher_emb[b, e_idx])
-        t_positives.append(teacher_emb[pos_b, e1_idx])
-        t_negatives.append(teacher_emb[neg_b, e2_idx])
+                e2_idx = min(max(0, e2_idx), t_enc - 1)
+                e1_idx = min(max(0, e1_idx), t_enc - 1)
+                e_idx = min(max(0, e_idx), t_enc - 1)
+
+                anchors.append(student_emb[b, e_idx])
+                positives.append(student_emb[pos_b, e1_idx])
+                negatives.append(student_emb[neg_b, e2_idx])
+                t_anchors.append(teacher_emb[b, e_idx])
+                t_positives.append(teacher_emb[pos_b, e1_idx])
+                t_negatives.append(teacher_emb[neg_b, e2_idx])
 
     if not anchors:
         zero = student_emb.new_zeros(())

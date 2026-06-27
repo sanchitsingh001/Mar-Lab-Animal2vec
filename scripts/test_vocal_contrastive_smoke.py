@@ -53,7 +53,7 @@ def test_contrastive_loss():
     vocal = [[[10, 11, 12, 13]], [[5, 6, 7]], [[20, 21, 22]], [[30, 31, 32, 33]]]
     non_vocal = [list(range(0, 5)), list(range(40, 50)), list(range(0, 4)), list(range(35, 50))]
     loss, stats = compute_contrastive_loss(s, t_emb, vocal, non_vocal, margin=0.2, anchor_weight=0.1)
-    assert stats["valid_triplets"] > 0
+    assert stats["valid_triplets"] == 14  # 4 + 3 + 3 + 4 frames across clips
     assert loss.requires_grad
     loss.backward()
     print("OK test_contrastive_loss:", stats)
@@ -83,7 +83,7 @@ def test_class_aware_contrastive_loss():
         class_aware=True,
         vocal_span_classes=classes,
     )
-    assert stats["valid_triplets"] > 0
+    assert stats["valid_triplets"] == 12  # 4 + 4 + 4 frames across clips
     assert stats.get("pos_same_class", 0) > 0
     assert stats.get("neg_diff_class", 0) > 0
     assert loss.requires_grad
