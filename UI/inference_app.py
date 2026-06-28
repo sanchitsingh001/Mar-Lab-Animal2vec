@@ -19,6 +19,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Xeno / data2vec_multi pretrain and vocal-contrastive checkpoints use 24 kHz audio.
+DEFAULT_SAMPLE_RATE = 24000
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -126,7 +129,19 @@ tab1, tab2, tab3 = st.tabs(["Embedding Generation", "Clustering", "Visualization
 # =========================
 # Helpers
 # =========================
-def run_streaming_subprocess(cmd: List[str], env: Optional[Dict[str, str]] = None) -> int:
+def normalize_server_path(path: str) -> str:
+    """Ensure absolute server paths; fix common 'home/ssingh/...' typo (missing leading /)."""
+    p = str(path).strip()
+    if p.startswith("home/"):
+        p = "/" + p
+    return p
+
+
+def run_streaming_subprocess(
+    cmd: List[str],
+    env: Optional[Dict[str, str]] = None,
+    cwd: Optional[str] = None,
+) -> int:
     st.code("Running command:\n" + " ".join(cmd), language="bash")
     process = subprocess.Popen(
         cmd,
@@ -134,6 +149,7 @@ def run_streaming_subprocess(cmd: List[str], env: Optional[Dict[str, str]] = Non
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=cwd,
     )
 
     stdout_placeholder = st.empty()
@@ -170,9 +186,12 @@ def run_tmux_job(
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         cmd_str = f'{cmd_str} > "{log_path}" 2>&1'
 
+    if cwd:
+        cmd_str = f'cd "{cwd}" && {cmd_str}'
+
     bash_cmd = ["bash", "-lc", cmd_str]
     tmux_cmd = ["tmux", "new-session", "-d", "-s", session_name] + bash_cmd
-    return run_streaming_subprocess(tmux_cmd, env=env)
+    return run_streaming_subprocess(tmux_cmd, env=env, cwd=cwd)
 
 
 def wav_bytes_from_float32(y: np.ndarray, sr: int) -> io.BytesIO:
@@ -301,6 +320,7 @@ def safe_spectrogram(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, np
 
 
 def load_h5_embeddings_for_clustering(emb_dir: str) -> pd.DataFrame:
+    emb_dir = emb_dir.strip()
     emb_dir_p = Path(emb_dir)
     if not emb_dir_p.exists():
         raise FileNotFoundError(f"Embeddings directory not found: {emb_dir}")
@@ -1061,7 +1081,10 @@ with tab1:
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
-            inference_script = st.text_input("Path to inference script", value="../animal2vec_inference.py")
+            inference_script = st.text_input(
+                "Path to inference script",
+                value=str(_REPO_ROOT / "animal2vec_inference.py"),
+            )
             wav_dir = st.text_input("WAV Directory", value="/home/ssingh/data/Datasets/Nips")
         with col2:
             checkpoint = st.text_input(
@@ -1074,11 +1097,23 @@ with tab1:
             )
 
         device = st.selectbox("Device", ["cuda", "cpu"], index=0)
+        sample_rate = st.number_input(
+            "Sample rate (Hz)",
+            min_value=8000,
+            max_value=48000,
+            value=DEFAULT_SAMPLE_RATE,
+            step=1000,
+            help="Must match the checkpoint (24000 for Xeno pretrain and vocal-contrastive finetunes).",
+        )
 
         write_embeddings = st.checkbox("Write embeddings (.h5)", value=True)
         write_other_predictions = st.checkbox("Write other predictions (CSV)", value=False)
         write_non_focal = st.checkbox("Write non-focal predictions (CSV)", value=False)
-        additional_args = st.text_input("Additional Arguments (optional)", value="")
+        additional_args = st.text_input(
+            "Additional Arguments (optional)",
+            value='--unique-values "[]" --overwrite-previous-preds True --average_top_k_layers 12',
+            help="Extra flags for animal2vec_inference.py. Sample rate is set by the field above.",
+        )
 
         st.markdown("---")
         st.subheader("Background execution (tmux)")
@@ -1088,6 +1123,14 @@ with tab1:
         write_log = st.checkbox("Write logs to file", value=True)
 
         if st.button("Generate", type="primary"):
+            wav_dir = normalize_server_path(wav_dir)
+            checkpoint = normalize_server_path(checkpoint)
+            output_dir = normalize_server_path(output_dir)
+            log_dir = normalize_server_path(log_dir)
+            if not output_dir.startswith("/"):
+                st.error("Output Directory must be an absolute path (start with /home/ssingh/...).")
+                st.stop()
+
             os.makedirs(output_dir, exist_ok=True)
 
             inner_cmd = [
@@ -1111,6 +1154,9 @@ with tab1:
 
             if additional_args.strip():
                 inner_cmd.extend(additional_args.split())
+
+            # Always pass sample rate last so it overrides any duplicate in additional_args.
+            inner_cmd.extend(["--sample-rate", str(int(sample_rate))])
 
             env = os.environ.copy()
             env["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -1141,7 +1187,7 @@ with tab1:
                 else:
                     st.error(f"Failed to start tmux job (exit code {rc}).")
             else:
-                rc = run_streaming_subprocess(inner_cmd, env=env)
+                rc = run_streaming_subprocess(inner_cmd, env=env, cwd=str(_REPO_ROOT))
                 if rc == 0:
                     st.success("Done.")
                 else:
@@ -1232,6 +1278,8 @@ with tab2:
             )
 
         if st.button("Run Clustering", type="primary"):
+            emb_input_dir = normalize_server_path(emb_input_dir.strip())
+            wav_csv_input_dir = normalize_server_path(wav_csv_input_dir.strip())
             try:
                 with st.spinner("Loading .h5 embeddings..."):
                     df_frames = load_h5_embeddings_for_clustering(emb_input_dir)
