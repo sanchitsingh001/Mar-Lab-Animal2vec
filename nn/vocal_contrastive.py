@@ -716,38 +716,71 @@ def compute_contrastive_loss(
     vocal_span_classes: Optional[List[List[ClassKey]]] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """
-    Contrastive loss on frame embeddings.
+    Contrastive triplet loss on per-frame encoder embeddings.
 
-    One triplet per encoder frame in every vocal span (when span has >= 2 frames):
-      - anchor (e): each frame in the span
-      - positive (e1): another frame from the same span (or same-class span if class_aware)
-      - negative (e2): sample_negative_frame() or class-aware diff-class fallback
-      - Triplet: max(0, d(anchor,pos) - d(anchor,neg) + margin) on cosine distance
-      - Anchor: mean cosine distance student vs frozen teacher at e, e1, e2
+    Goal: finetune the student model so vocal frames cluster by vocalization while
+    staying close to the frozen pretrained (teacher) representations.
 
-    student_emb, teacher_emb: (B, T, D)
-    Returns scalar loss and logging dict (pos_dist, neg_dist, valid_triplets, ...).
+    Inputs
+    ------
+    student_emb / teacher_emb : (B, T, D)
+        Frame embeddings from the trainable student and frozen teacher encoders.
+        B = batch size, T = encoder time steps, D = embedding dim.
+    vocal_spans_enc : List[List[List[int]]]
+        Per-clip vocalization spans mapped to encoder frame indices.
+        Shape conceptually: [batch_idx][vocalization_idx] -> [frame, frame, ...]
+        Each inner list is one labeled vocal event (e.g. one bird call).
+    non_vocal_enc : List[List[int]]
+        Per-clip encoder frames that fall outside any vocal span (background/silence).
+    class_aware : bool
+        If True, positives prefer same species/call label; negatives prefer diff label.
+
+    Triplet construction (matches professor pseudocode)
+    ---------------------------------------------------
+    for each clip b in batch:
+        for each vocalization span in clip b:
+            for each encoder frame e_idx in that span:
+                anchor   = student_emb[b, e_idx]
+                positive = another frame from the same vocalization (or same class)
+                negative = frame from non-vocal / other span / other clip in batch
+                collect (anchor, positive, negative)
+
+    Loss
+    ----
+    1. Triplet margin: max(0, d(anchor,pos) - d(anchor,neg) + margin) on cosine distance
+       -> pull anchor closer to positive, push anchor away from negative.
+    2. Teacher anchor (weighted): keep student embeddings near teacher at all three frames
+       -> prevents catastrophic drift away from pretraining.
+
+    Returns scalar loss and a stats dict for logging.
     """
     rng = rng or np.random.default_rng()
     bsz, t_enc, _ = student_emb.shape
 
+    # Collect one (anchor, positive, negative) triplet per vocal frame.
     anchors, positives, negatives = [], [], []
+    # Same triplets from the frozen teacher — used only for the anchor regularizer.
     t_anchors, t_positives, t_negatives = [], [], []
+    # Counters for class-aware sampling diagnostics (logged when class_aware=True).
     pos_same_class = 0
     neg_diff_class = 0
 
+    # --- Triplet sampling: batch -> vocalization -> frame ---
     for b in range(bsz):
-        spans = vocal_spans_enc[b]
+        spans = vocal_spans_enc[b]  # all vocalizations in clip b
         if not spans:
             continue
 
         for span_idx, span in enumerate(spans):
+            # Need >= 2 frames so we can pick a distinct positive from the same span.
             if len(span) < 2:
                 continue
 
+            # Every frame in this vocalization becomes an anchor.
             for e_idx in span:
                 if class_aware and vocal_span_classes is not None:
                     anchor_class = vocal_span_classes[b][span_idx]
+                    # Positive: prefer same-class vocal frame from another span; else same span.
                     pos_b, e1_idx, _pos_si, same_cls = sample_class_aware_positive(
                         b,
                         span_idx,
@@ -757,6 +790,7 @@ def compute_contrastive_loss(
                         rng,
                         anchor_frame_idx=e_idx,
                     )
+                    # Negative: prefer different-class vocal frame; else sample_negative_frame().
                     neg_b, e2_idx, diff_cls = sample_class_aware_negative(
                         b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, non_vocal_enc, rng
                     )
@@ -765,20 +799,24 @@ def compute_contrastive_loss(
                     if diff_cls:
                         neg_diff_class += 1
                 else:
+                    # Default path: positive from same vocalization, negative via 3-way sampler.
                     others = [i for i in span if i != e_idx]
                     if not others:
                         continue
                     e1_idx = int(rng.choice(others))
                     e2_idx = sample_negative_frame(b, span_idx, vocal_spans_enc, non_vocal_enc, rng)
-                    pos_b, neg_b = b, b
+                    pos_b, neg_b = b, b  # both from same clip unless class_aware moved them
 
+                # Clamp indices in case span mapping and tensor length disagree slightly.
                 e2_idx = min(max(0, e2_idx), t_enc - 1)
                 e1_idx = min(max(0, e1_idx), t_enc - 1)
                 e_idx = min(max(0, e_idx), t_enc - 1)
 
+                # Gather student embeddings for this triplet.
                 anchors.append(student_emb[b, e_idx])
                 positives.append(student_emb[pos_b, e1_idx])
                 negatives.append(student_emb[neg_b, e2_idx])
+                # Matching teacher embeddings (anchor always from clip b; pos/neg may differ).
                 t_anchors.append(teacher_emb[b, e_idx])
                 t_positives.append(teacher_emb[pos_b, e1_idx])
                 t_negatives.append(teacher_emb[neg_b, e2_idx])
@@ -787,16 +825,18 @@ def compute_contrastive_loss(
         zero = student_emb.new_zeros(())
         return zero, {"valid_triplets": 0}
 
+    # Stack all triplets into (N, D) tensors and L2-normalize for cosine distance.
     a = F.normalize(torch.stack(anchors), dim=-1)
     p = F.normalize(torch.stack(positives), dim=-1)
     n = F.normalize(torch.stack(negatives), dim=-1)
 
-    # Cosine distance = 1 - cosine_similarity; pull pos closer, push neg farther.
+    # Triplet loss: want d(anchor, pos) + margin < d(anchor, neg).
+    # Cosine distance = 1 - cosine_similarity; ReLU zeroes satisfied triplets.
     d_pos = 1.0 - (a * p).sum(dim=-1)
     d_neg = 1.0 - (a * n).sum(dim=-1)
     loss_triplet = F.relu(d_pos - d_neg + margin).mean()
 
-    # Teacher anchor: penalize drift from pretrained representations.
+    # Regularizer: student should not drift far from frozen teacher on anchor/pos/neg frames.
     ta = F.normalize(torch.stack(t_anchors), dim=-1)
     tp = F.normalize(torch.stack(t_positives), dim=-1)
     tn = F.normalize(torch.stack(t_negatives), dim=-1)
