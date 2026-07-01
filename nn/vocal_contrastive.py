@@ -7,15 +7,14 @@
 #      to filter out Empty/Unknown/silence rows — we do NOT train a classifier.
 #   2. Intervals are mapped from wav samples -> encoder frame indices (one frame
 #      per CNN+transformer time step) so triplets are sampled in embedding space.
-#   3. Loss = triplet margin on cosine distance + small teacher-anchor term:
+#   3. Loss = triplet margin on cosine distance:
 #        - every frame in each vocal span is an anchor; positive from same span
-#        - negative: non-vocal frame, different span, or different file in batch
-#        - anchor term: keep student embeddings close to frozen teacher (pretrain)
+#        - negative: non-vocal frame in same clip or vocal frame from another file in batch
 
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -591,51 +590,184 @@ def average_layer_embeddings(model, layer_results, average_top_k_layers: int) ->
     return (sum(target) / len(target)).float()
 
 
+def class_display_name(class_key: ClassKey) -> str:
+    if isinstance(class_key, int) and 0 <= class_key < len(NIPS_CLASS_NAMES):
+        return NIPS_CLASS_NAMES[class_key]
+    return str(class_key)
+
+
+def frame_class_at(
+    batch_idx: int,
+    frame_idx: int,
+    vocal_spans_enc: List[List[List[int]]],
+    vocal_span_classes: List[List[ClassKey]],
+) -> Optional[ClassKey]:
+    """Return class_key if frame falls in a vocal span, else None (non-vocal)."""
+    for si, span in enumerate(vocal_spans_enc[batch_idx]):
+        if frame_idx in span:
+            return vocal_span_classes[batch_idx][si]
+    return None
+
+
+@dataclass
+class SamplingStats:
+    """Accumulates triplet sampling diagnostics across training steps."""
+
+    anchors: int = 0
+    pos_same_class: int = 0
+    pos_same_span_fallback: int = 0
+    neg_diff_class: int = 0
+    neg_same_class: int = 0
+    neg_non_vocal: int = 0
+    neg_by_source: dict = field(default_factory=dict)
+    per_class: dict = field(default_factory=dict)
+
+    def _per_class_bucket(self, anchor_class: ClassKey) -> dict:
+        key = class_display_name(anchor_class)
+        if key not in self.per_class:
+            self.per_class[key] = {
+                "anchors": 0,
+                "pos_same_class": 0,
+                "pos_same_span_fallback": 0,
+                "neg_diff_class": 0,
+                "neg_same_class": 0,
+                "neg_non_vocal": 0,
+                "neg_by_source": {},
+            }
+        return self.per_class[key]
+
+    def record_triplet(
+        self,
+        anchor_class: ClassKey,
+        pos_used_same_class: bool,
+        neg_batch_idx: int,
+        neg_frame_idx: int,
+        neg_source: str,
+        vocal_spans_enc: List[List[List[int]]],
+        vocal_span_classes: List[List[ClassKey]],
+    ) -> None:
+        self.anchors += 1
+        if pos_used_same_class:
+            self.pos_same_class += 1
+        else:
+            self.pos_same_span_fallback += 1
+
+        neg_cls = frame_class_at(neg_batch_idx, neg_frame_idx, vocal_spans_enc, vocal_span_classes)
+        if neg_cls is None:
+            self.neg_non_vocal += 1
+        elif neg_cls == anchor_class:
+            self.neg_same_class += 1
+        else:
+            self.neg_diff_class += 1
+
+        self.neg_by_source[neg_source] = self.neg_by_source.get(neg_source, 0) + 1
+
+        bucket = self._per_class_bucket(anchor_class)
+        bucket["anchors"] += 1
+        if pos_used_same_class:
+            bucket["pos_same_class"] += 1
+        else:
+            bucket["pos_same_span_fallback"] += 1
+        if neg_cls is None:
+            bucket["neg_non_vocal"] += 1
+        elif neg_cls == anchor_class:
+            bucket["neg_same_class"] += 1
+        else:
+            bucket["neg_diff_class"] += 1
+        bucket["neg_by_source"][neg_source] = bucket["neg_by_source"].get(neg_source, 0) + 1
+
+    def merge(self, other: "SamplingStats") -> None:
+        self.anchors += other.anchors
+        self.pos_same_class += other.pos_same_class
+        self.pos_same_span_fallback += other.pos_same_span_fallback
+        self.neg_diff_class += other.neg_diff_class
+        self.neg_same_class += other.neg_same_class
+        self.neg_non_vocal += other.neg_non_vocal
+        for source, count in other.neg_by_source.items():
+            self.neg_by_source[source] = self.neg_by_source.get(source, 0) + count
+        for class_name, bucket in other.per_class.items():
+            dst = self._per_class_bucket(class_name)
+            for k in (
+                "anchors",
+                "pos_same_class",
+                "pos_same_span_fallback",
+                "neg_diff_class",
+                "neg_same_class",
+                "neg_non_vocal",
+            ):
+                dst[k] += bucket[k]
+            for source, count in bucket["neg_by_source"].items():
+                dst["neg_by_source"][source] = dst["neg_by_source"].get(source, 0) + count
+
+    def to_dict(self) -> dict:
+        n = max(self.anchors, 1)
+        out = {
+            "anchors": self.anchors,
+            "pos_same_class": self.pos_same_class,
+            "pos_same_span_fallback": self.pos_same_span_fallback,
+            "neg_diff_class": self.neg_diff_class,
+            "neg_same_class": self.neg_same_class,
+            "neg_non_vocal": self.neg_non_vocal,
+            "neg_by_source": dict(self.neg_by_source),
+            "pos_same_class_rate": self.pos_same_class / n,
+            "neg_diff_class_rate": self.neg_diff_class / n,
+            "neg_same_class_rate": self.neg_same_class / n,
+            "neg_non_vocal_rate": self.neg_non_vocal / n,
+            "per_class_sampling": {},
+        }
+        for class_name, bucket in self.per_class.items():
+            cn = max(bucket["anchors"], 1)
+            out["per_class_sampling"][class_name] = {
+                **bucket,
+                "neg_diff_class_rate": bucket["neg_diff_class"] / cn,
+                "neg_same_class_rate": bucket["neg_same_class"] / cn,
+            }
+        return out
+
+
 def sample_negative_frame(
     batch_idx: int,
     anchor_span_idx: int,
     vocal_spans_enc: List[List[List[int]]],
     non_vocal_enc: List[List[int]],
     rng: np.random.Generator,
-) -> int:
-    """Pick negative encoder frame; never from the same vocalization span as the anchor.
+    noise_prob: float = 0.5,
+) -> Tuple[int, int, str]:
+    """Pick negative encoder frame; never from the anchor vocalization span.
 
-    Roughly equal random choice among:
-      (0) non-vocal frame in the same clip
-      (1) vocal frame from a different span in the same clip
-      (2) vocal frame from a different clip in the batch
-  Fallbacks ensure a negative is always found when possible.
+    With probability noise_prob: non-vocal frame in the same clip; otherwise a vocal
+    frame from a different clip in the batch. Same-clip other-vocalization negatives
+    are intentionally excluded (sequential bird calls often share species).
+    Returns (neg_batch_idx, neg_frame_idx, neg_source).
     """
     b = batch_idx
-    choice = rng.integers(0, 3)
+    use_noise = rng.random() < noise_prob
+    other_batches = [j for j in range(len(vocal_spans_enc)) if j != b and vocal_spans_enc[j]]
 
-    # Prefer non-vocal silence/background within the same recording.
-    if choice == 0 and non_vocal_enc[b]:
-        return int(rng.choice(non_vocal_enc[b]))
-
-    other_span_indices = [i for i in range(len(vocal_spans_enc[b])) if i != anchor_span_idx]
-    # Different vocalization in the same clip (e.g. two bird calls).
-    if choice == 1 and other_span_indices:
-        si = int(rng.choice(other_span_indices))
-        return int(rng.choice(vocal_spans_enc[b][si]))
-
-    # Vocal frame from a different recording in the same batch.
-    other = [j for j in range(len(vocal_spans_enc)) if j != b and vocal_spans_enc[j]]
-    if other:
-        j = int(rng.choice(other))
+    def pick_other_file() -> Tuple[int, int, str]:
+        j = int(rng.choice(other_batches))
         si = int(rng.integers(0, len(vocal_spans_enc[j])))
-        return int(rng.choice(vocal_spans_enc[j][si]))
+        return j, int(rng.choice(vocal_spans_enc[j][si])), "other_file"
+
+    def pick_noise() -> Tuple[int, int, str]:
+        return b, int(rng.choice(non_vocal_enc[b])), "noise_same_clip"
+
+    if use_noise and non_vocal_enc[b]:
+        return pick_noise()
+    if other_batches:
+        return pick_other_file()
 
     if non_vocal_enc[b]:
-        return int(rng.choice(non_vocal_enc[b]))
-    if other_span_indices:
-        si = int(rng.choice(other_span_indices))
-        return int(rng.choice(vocal_spans_enc[b][si]))
+        return pick_noise()
+    if other_batches:
+        return pick_other_file()
 
-    anchor_span = vocal_spans_enc[b][anchor_span_idx]
-    t_enc = max(anchor_span) + 1
-    candidates = [i for i in range(t_enc) if i not in set(anchor_span)]
-    return int(rng.choice(candidates)) if candidates else int(rng.choice(anchor_span))
+    anchor_span = set(vocal_spans_enc[b][anchor_span_idx])
+    t_enc = max(anchor_span) + 1 if anchor_span else 1
+    candidates = [i for i in range(t_enc) if i not in anchor_span]
+    if candidates:
+        return b, int(rng.choice(candidates)), "fallback_non_anchor"
+    return b, int(rng.choice(list(anchor_span))), "fallback_non_anchor"
 
 
 def sample_class_aware_positive(
@@ -649,8 +781,9 @@ def sample_class_aware_positive(
 ) -> Tuple[int, int, int, bool]:
     """Return (batch_idx, frame_idx, pos_span_idx, used_same_class).
 
-    Prefer a vocal frame from a different span with the same class_key.
-  Fallback: another frame from the anchor span (distinct from anchor when possible).
+    Prefer a vocal frame with the same class_key from a different clip in the batch.
+    Fallback: another frame from the anchor span (distinct from anchor when possible).
+    Same-clip other-vocalization positives are excluded (sequential calls often share species).
     """
     b = batch_idx
     anchor_span = vocal_spans_enc[b][anchor_span_idx]
@@ -660,7 +793,7 @@ def sample_class_aware_positive(
         (bb, si)
         for bb in range(len(vocal_spans_enc))
         for si, cls in enumerate(vocal_span_classes[bb])
-        if cls == anchor_class and vocal_spans_enc[bb][si] and (bb != b or si != anchor_span_idx)
+        if bb != b and cls == anchor_class and vocal_spans_enc[bb][si]
     ]
     if other_spans:
         bb, si = other_spans[int(rng.integers(0, len(other_spans)))]
@@ -684,103 +817,93 @@ def sample_class_aware_negative(
     vocal_span_classes: List[List[ClassKey]],
     non_vocal_enc: List[List[int]],
     rng: np.random.Generator,
-) -> Tuple[int, int, bool]:
-    """Return (batch_idx, frame_idx, used_diff_class).
+    noise_prob: float = 0.5,
+) -> Tuple[int, int, bool, str]:
+    """Return (batch_idx, frame_idx, used_diff_class, neg_source).
 
-    Prefer a vocal frame from a span with class_key != anchor_class.
-  Fallback: sample_negative_frame (non-vocal / other span / other file).
+    Prefer a vocal frame with class_key != anchor_class from a different clip in the batch.
+    Fallback: sample_negative_frame (noise same clip / other file in batch).
+    Same-clip other-vocalization negatives are excluded.
     """
     diff_spans = [
         (bb, si)
         for bb in range(len(vocal_spans_enc))
         for si, cls in enumerate(vocal_span_classes[bb])
-        if cls != anchor_class and vocal_spans_enc[bb][si]
+        if bb != batch_idx and cls != anchor_class and vocal_spans_enc[bb][si]
     ]
     if diff_spans:
         bb, si = diff_spans[int(rng.integers(0, len(diff_spans)))]
-        return bb, int(rng.choice(vocal_spans_enc[bb][si])), True
+        return bb, int(rng.choice(vocal_spans_enc[bb][si])), True, "diff_class_vocal"
 
-    frame = sample_negative_frame(batch_idx, anchor_span_idx, vocal_spans_enc, non_vocal_enc, rng)
-    return batch_idx, frame, False
+    neg_b, frame, source = sample_negative_frame(
+        batch_idx, anchor_span_idx, vocal_spans_enc, non_vocal_enc, rng, noise_prob=noise_prob
+    )
+    return neg_b, frame, False, source
 
 
 def compute_contrastive_loss(
     student_emb: torch.Tensor,
-    teacher_emb: torch.Tensor,
     vocal_spans_enc: List[List[List[int]]],
     non_vocal_enc: List[List[int]],
     margin: float = 0.2,
-    anchor_weight: float = 0.1,
     rng: Optional[np.random.Generator] = None,
     class_aware: bool = False,
     vocal_span_classes: Optional[List[List[ClassKey]]] = None,
+    noise_prob: float = 0.5,
+    stats_accumulator: Optional[SamplingStats] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Contrastive triplet loss on per-frame encoder embeddings.
 
-    Goal: finetune the student model so vocal frames cluster by vocalization while
-    staying close to the frozen pretrained (teacher) representations.
+    Goal: finetune the student model so vocal frames cluster by vocalization.
 
     Inputs
     ------
-    student_emb / teacher_emb : (B, T, D)
-        Frame embeddings from the trainable student and frozen teacher encoders.
-        B = batch size, T = encoder time steps, D = embedding dim.
+    student_emb : (B, T, D)
+        Frame embeddings from the trainable student encoder.
     vocal_spans_enc : List[List[List[int]]]
         Per-clip vocalization spans mapped to encoder frame indices.
-        Shape conceptually: [batch_idx][vocalization_idx] -> [frame, frame, ...]
-        Each inner list is one labeled vocal event (e.g. one bird call).
     non_vocal_enc : List[List[int]]
-        Per-clip encoder frames that fall outside any vocal span (background/silence).
+        Per-clip encoder frames outside any vocal span (background/silence).
     class_aware : bool
-        If True, positives prefer same species/call label; negatives prefer diff label.
+        If True, positives prefer same label from another file in batch; negatives prefer
+        diff label from another file in batch (never another vocalization in the same clip).
 
-    Triplet construction (matches professor pseudocode)
-    ---------------------------------------------------
+    Triplet construction
+    --------------------
     for each clip b in batch:
         for each vocalization span in clip b:
             for each encoder frame e_idx in that span:
                 anchor   = student_emb[b, e_idx]
                 positive = another frame from the same vocalization (or same class)
-                negative = frame from non-vocal / other span / other clip in batch
+                negative = non-vocal same clip or vocal frame from another file in batch
                 collect (anchor, positive, negative)
 
-    Loss
-    ----
-    1. Triplet margin: max(0, d(anchor,pos) - d(anchor,neg) + margin) on cosine distance
-       -> pull anchor closer to positive, push anchor away from negative.
-    2. Teacher anchor (weighted): keep student embeddings near teacher at all three frames
-       -> prevents catastrophic drift away from pretraining.
+    Loss: triplet margin max(0, d(anchor,pos) - d(anchor,neg) + margin) on cosine distance.
 
     Returns scalar loss and a stats dict for logging.
     """
     rng = rng or np.random.default_rng()
     bsz, t_enc, _ = student_emb.shape
+    span_classes = vocal_span_classes or [[] for _ in range(bsz)]
 
-    # Collect one (anchor, positive, negative) triplet per vocal frame.
     anchors, positives, negatives = [], [], []
-    # Same triplets from the frozen teacher — used only for the anchor regularizer.
-    t_anchors, t_positives, t_negatives = [], [], []
-    # Counters for class-aware sampling diagnostics (logged when class_aware=True).
-    pos_same_class = 0
-    neg_diff_class = 0
+    batch_stats = SamplingStats()
 
-    # --- Triplet sampling: batch -> vocalization -> frame ---
     for b in range(bsz):
-        spans = vocal_spans_enc[b]  # all vocalizations in clip b
+        spans = vocal_spans_enc[b]
         if not spans:
             continue
 
         for span_idx, span in enumerate(spans):
-            # Need >= 2 frames so we can pick a distinct positive from the same span.
             if len(span) < 2:
                 continue
 
-            # Every frame in this vocalization becomes an anchor.
+            anchor_class = span_classes[b][span_idx] if span_idx < len(span_classes[b]) else "unknown"
+
             for e_idx in span:
                 if class_aware and vocal_span_classes is not None:
                     anchor_class = vocal_span_classes[b][span_idx]
-                    # Positive: prefer same-class vocal frame from another span; else same span.
                     pos_b, e1_idx, _pos_si, same_cls = sample_class_aware_positive(
                         b,
                         span_idx,
@@ -790,71 +913,67 @@ def compute_contrastive_loss(
                         rng,
                         anchor_frame_idx=e_idx,
                     )
-                    # Negative: prefer different-class vocal frame; else sample_negative_frame().
-                    neg_b, e2_idx, diff_cls = sample_class_aware_negative(
-                        b, span_idx, anchor_class, vocal_spans_enc, vocal_span_classes, non_vocal_enc, rng
+                    neg_b, e2_idx, _diff_cls, neg_source = sample_class_aware_negative(
+                        b,
+                        span_idx,
+                        anchor_class,
+                        vocal_spans_enc,
+                        vocal_span_classes,
+                        non_vocal_enc,
+                        rng,
+                        noise_prob=noise_prob,
                     )
-                    if same_cls:
-                        pos_same_class += 1
-                    if diff_cls:
-                        neg_diff_class += 1
+                    pos_used_same_class = same_cls
                 else:
-                    # Default path: positive from same vocalization, negative via 3-way sampler.
                     others = [i for i in span if i != e_idx]
                     if not others:
                         continue
                     e1_idx = int(rng.choice(others))
-                    e2_idx = sample_negative_frame(b, span_idx, vocal_spans_enc, non_vocal_enc, rng)
-                    pos_b, neg_b = b, b  # both from same clip unless class_aware moved them
+                    neg_b, e2_idx, neg_source = sample_negative_frame(
+                        b, span_idx, vocal_spans_enc, non_vocal_enc, rng, noise_prob=noise_prob
+                    )
+                    pos_b = b
+                    pos_used_same_class = False
 
-                # Clamp indices in case span mapping and tensor length disagree slightly.
                 e2_idx = min(max(0, e2_idx), t_enc - 1)
                 e1_idx = min(max(0, e1_idx), t_enc - 1)
                 e_idx = min(max(0, e_idx), t_enc - 1)
 
-                # Gather student embeddings for this triplet.
                 anchors.append(student_emb[b, e_idx])
                 positives.append(student_emb[pos_b, e1_idx])
                 negatives.append(student_emb[neg_b, e2_idx])
-                # Matching teacher embeddings (anchor always from clip b; pos/neg may differ).
-                t_anchors.append(teacher_emb[b, e_idx])
-                t_positives.append(teacher_emb[pos_b, e1_idx])
-                t_negatives.append(teacher_emb[neg_b, e2_idx])
+
+                batch_stats.record_triplet(
+                    anchor_class,
+                    pos_used_same_class,
+                    neg_b,
+                    e2_idx,
+                    neg_source,
+                    vocal_spans_enc,
+                    span_classes,
+                )
+
+    if stats_accumulator is not None:
+        stats_accumulator.merge(batch_stats)
 
     if not anchors:
         zero = student_emb.new_zeros(())
         return zero, {"valid_triplets": 0}
 
-    # Stack all triplets into (N, D) tensors and L2-normalize for cosine distance.
     a = F.normalize(torch.stack(anchors), dim=-1)
     p = F.normalize(torch.stack(positives), dim=-1)
     n = F.normalize(torch.stack(negatives), dim=-1)
 
-    # Triplet loss: want d(anchor, pos) + margin < d(anchor, neg).
-    # Cosine distance = 1 - cosine_similarity; ReLU zeroes satisfied triplets.
     d_pos = 1.0 - (a * p).sum(dim=-1)
     d_neg = 1.0 - (a * n).sum(dim=-1)
     loss_triplet = F.relu(d_pos - d_neg + margin).mean()
 
-    # Regularizer: student should not drift far from frozen teacher on anchor/pos/neg frames.
-    ta = F.normalize(torch.stack(t_anchors), dim=-1)
-    tp = F.normalize(torch.stack(t_positives), dim=-1)
-    tn = F.normalize(torch.stack(t_negatives), dim=-1)
-    loss_anchor = (
-        (1.0 - (a * ta).sum(dim=-1)).mean()
-        + (1.0 - (p * tp).sum(dim=-1)).mean()
-        + (1.0 - (n * tn).sum(dim=-1)).mean()
-    ) / 3.0
-
-    loss = loss_triplet + anchor_weight * loss_anchor
     stats = {
         "valid_triplets": len(anchors),
         "loss_triplet": float(loss_triplet.detach().cpu()),
-        "loss_anchor": float(loss_anchor.detach().cpu()),
         "pos_dist": float(d_pos.mean().detach().cpu()),
         "neg_dist": float(d_neg.mean().detach().cpu()),
+        **{k: v for k, v in batch_stats.to_dict().items() if k != "per_class_sampling"},
+        "per_class_sampling": batch_stats.to_dict()["per_class_sampling"],
     }
-    if class_aware:
-        stats["pos_same_class"] = pos_same_class
-        stats["neg_diff_class"] = neg_diff_class
-    return loss, stats
+    return loss_triplet, stats

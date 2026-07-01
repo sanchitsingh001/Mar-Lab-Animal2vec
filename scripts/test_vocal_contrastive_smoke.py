@@ -16,6 +16,8 @@ from nn.vocal_contrastive import (
     compute_contrastive_loss,
     intervals_to_encoder_frame_lists,
     read_vocal_intervals_seconds,
+    sample_class_aware_negative,
+    sample_negative_frame,
 )
 
 
@@ -46,14 +48,61 @@ def test_csv_indices():
     print("OK test_csv_indices:", iv)
 
 
+def test_sample_negative_frame_no_same_clip_other_vocal():
+    rng = np.random.default_rng(0)
+    # clip 0: two vocal spans; clip 1: one span — other-file negatives always available.
+    vocal = [
+        [[10, 11, 12, 13], [20, 21, 22]],
+        [[5, 6, 7, 8]],
+    ]
+    non_vocal = [list(range(0, 5)), list(range(40, 50))]
+    anchor_span_frames = set(vocal[0][1])
+    for _ in range(200):
+        neg_b, neg_frame, source = sample_negative_frame(0, 1, vocal, non_vocal, rng, noise_prob=0.0)
+        if source == "other_file":
+            assert neg_b == 1
+            assert neg_frame in vocal[1][0]
+        else:
+            assert neg_frame not in anchor_span_frames
+            assert neg_frame not in vocal[0][0]
+    print("OK test_sample_negative_frame_no_same_clip_other_vocal")
+
+
+def test_class_aware_negative_no_same_clip_other_vocal():
+    rng = np.random.default_rng(1)
+    vocal = [
+        [[10, 11, 12, 13], [20, 21, 22, 23]],  # clip 0: class 1 and class 2
+        [[5, 6, 7, 8]],
+    ]
+    classes = [[1, 2], [1]]
+    non_vocal = [list(range(0, 5)), list(range(40, 50))]
+    anchor_span_frames = set(vocal[0][0])
+    other_same_clip_span = set(vocal[0][1])
+    for _ in range(200):
+        neg_b, neg_frame, diff_cls, source = sample_class_aware_negative(
+            0, 0, 1, vocal, classes, non_vocal, rng, noise_prob=0.0
+        )
+        assert neg_frame not in anchor_span_frames
+        assert neg_frame not in other_same_clip_span or source != "diff_class_vocal"
+        if source == "diff_class_vocal":
+            assert neg_b != 0
+        if neg_b == 0:
+            assert neg_frame not in vocal[0][0] and neg_frame not in vocal[0][1]
+    print("OK test_class_aware_negative_no_same_clip_other_vocal")
+
+
 def test_contrastive_loss():
     b, t, d = 4, 50, 32
     s = torch.randn(b, t, d, requires_grad=True)
-    t_emb = s.detach().clone()
     vocal = [[[10, 11, 12, 13]], [[5, 6, 7]], [[20, 21, 22]], [[30, 31, 32, 33]]]
     non_vocal = [list(range(0, 5)), list(range(40, 50)), list(range(0, 4)), list(range(35, 50))]
-    loss, stats = compute_contrastive_loss(s, t_emb, vocal, non_vocal, margin=0.2, anchor_weight=0.1)
-    assert stats["valid_triplets"] == 14  # 4 + 3 + 3 + 4 frames across clips
+    classes = [[3], [5], [7], [9]]
+    loss, stats = compute_contrastive_loss(
+        s, vocal, non_vocal, margin=0.2, vocal_span_classes=classes
+    )
+    assert stats["valid_triplets"] == 14
+    assert "neg_diff_class_rate" in stats
+    assert "neg_by_source" in stats
     assert loss.requires_grad
     loss.backward()
     print("OK test_contrastive_loss:", stats)
@@ -62,8 +111,6 @@ def test_contrastive_loss():
 def test_class_aware_contrastive_loss():
     b, t, d = 3, 50, 32
     s = torch.randn(b, t, d, requires_grad=True)
-    t_emb = s.detach().clone()
-    # clip0: class 1; clip1: class 2; clip2: class 1 (same as clip0)
     vocal = [
         [[10, 11, 12, 13]],
         [[5, 6, 7, 8]],
@@ -74,18 +121,17 @@ def test_class_aware_contrastive_loss():
     rng = np.random.default_rng(0)
     loss, stats = compute_contrastive_loss(
         s,
-        t_emb,
         vocal,
         non_vocal,
         margin=0.2,
-        anchor_weight=0.1,
         rng=rng,
         class_aware=True,
         vocal_span_classes=classes,
     )
-    assert stats["valid_triplets"] == 12  # 4 + 4 + 4 frames across clips
+    assert stats["valid_triplets"] == 12
     assert stats.get("pos_same_class", 0) > 0
     assert stats.get("neg_diff_class", 0) > 0
+    assert "per_class_sampling" in stats
     assert loss.requires_grad
     loss.backward()
     print("OK test_class_aware_contrastive_loss:", stats)
@@ -94,6 +140,8 @@ def test_class_aware_contrastive_loss():
 if __name__ == "__main__":
     test_interval_mapping()
     test_csv_indices()
+    test_sample_negative_frame_no_same_clip_other_vocal()
+    test_class_aware_negative_no_same_clip_other_vocal()
     test_contrastive_loss()
     test_class_aware_contrastive_loss()
     print("All smoke tests passed.")

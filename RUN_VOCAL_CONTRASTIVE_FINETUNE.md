@@ -4,10 +4,11 @@ Self-supervised **contrastive** finetune on vocal regions from CSV labels. Same-
 
 ## What it does
 
-- Loads a pretrained `data2vec_multi` checkpoint (student + frozen teacher copy).
+- Loads a pretrained `data2vec_multi` checkpoint (student only).
 - Reads wav paths from a Fairseq manifest (`train_0.tsv`).
-- Uses CSV only to find vocalization `[start, end)` intervals (class names ignored except `Empty`/`Unknown` filtering).
-- Loss: **triplet margin** on cosine distance + small **teacher anchor** to limit drift from pretrain.
+- Uses CSV for vocalization `[start, end)` intervals; class ids are used for optional class-aware sampling and sampling diagnostics.
+- Loss: **triplet margin** on cosine distance (no teacher anchor term).
+- Negative sampling: **50/50** noise in same clip vs vocal frame from another file in the batch (no same-clip other-vocal negatives).
 
 ## Data layout
 
@@ -55,8 +56,12 @@ python scripts/vocal_contrastive_finetune.py \
 ```
 
 Optional: `--freeze-feature-extractor` trains only the shared transformer (safer on small data).
+Optional: `--class-aware` uses same-class positives and different-class negatives from **other files in the batch only** (never another vocalization in the same clip).
+Optional: `--noise-negative-prob 0.5` controls noise vs other-file negative mix (try `0.25` in a later experiment only).
 
-Logs: `pos_dist` should fall below `neg_dist`; `loss_triplet` should decrease.
+Logs: `pos_dist` should fall below `neg_dist`; `loss_triplet` should decrease. Each log interval reports sampling rates (`neg_diff`, `neg_same`, `pos_same`) and `sec/up`.
+
+After training, `{save_dir}/training_summary.json` contains args, sampling config, runtime, and aggregated per-class sampling stats. `{save_dir}/training_stats.jsonl` has per-log-interval rows.
 
 ## Embeddings (same as pretrain)
 

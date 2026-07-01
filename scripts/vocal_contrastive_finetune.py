@@ -5,17 +5,18 @@
 #
 # Training recipe (self-supervised, not classification):
 #   - Student: pretrained data2vec_multi, updated by AdamW
-#   - Teacher: copy of same checkpoint, frozen (used only for anchor loss)
 #   - Data: Fairseq manifest (wav paths) + CSV vocal intervals
 #   - Forward: extract_features -> average top-K layer embeddings (B, T, D)
-#   - Loss: triplet margin on vocal vs non-vocal/cross-span frames + teacher anchor
+#   - Loss: triplet margin on vocal vs non-vocal/cross-file frames
 #   - Output: Fairseq .pt checkpoint compatible with animal2vec_inference.py
 
 import argparse
+import json
 import logging
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,7 @@ import nn  # noqa: F401 — register data2vec_multi
 from fairseq import checkpoint_utils
 from nn.vocal_contrastive import (
     LabelConfig,
+    SamplingStats,
     VocalContrastiveDataset,
     average_layer_embeddings,
     compute_contrastive_loss,
@@ -46,7 +48,7 @@ from nn.vocal_contrastive import (
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Vocal contrastive finetune (triplet + teacher anchor)")
+    p = argparse.ArgumentParser(description="Vocal contrastive finetune (triplet loss)")
     p.add_argument("--pretrain-ckpt", required=True, help="Pretrained data2vec_multi .pt checkpoint")
     p.add_argument("--manifest-dir", required=True, help="Directory containing train_0.tsv etc.")
     p.add_argument("--train-subset", default="train_0", help="Manifest basename without .tsv")
@@ -60,7 +62,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--warmup-updates", type=int, default=500)
     p.add_argument("--margin", type=float, default=0.2)
-    p.add_argument("--anchor-weight", type=float, default=0.1)
+    p.add_argument("--noise-negative-prob", type=float, default=0.5, help="P(noise same clip) vs other-file negative")
     p.add_argument("--average-top-k-layers", type=int, default=12)
     p.add_argument("--save-interval-updates", type=int, default=1000)
     p.add_argument("--log-interval", type=int, default=50)
@@ -73,7 +75,7 @@ def parse_args():
     p.add_argument(
         "--class-aware",
         action="store_true",
-        help="Diagnostic: same-class positives / different-class negatives (uses CSV class_id)",
+        help="Diagnostic: same-class pos / diff-class neg from other files in batch only",
     )
     return p.parse_args()
 
@@ -86,18 +88,12 @@ def get_lr(step: int, warmup: int, max_updates: int, peak_lr: float) -> float:
     return peak_lr * 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def load_models(pretrain_ckpt: str, device: str):
-    """Load student (trainable) and teacher (frozen) from the same pretrain ckpt."""
-    # Fairseq models hold lazy task refs; deepcopy triggers RecursionError.
+def load_student(pretrain_ckpt: str, device: str):
+    """Load trainable student from pretrain checkpoint."""
     student_models, _cfg = checkpoint_utils.load_model_ensemble([pretrain_ckpt])
-    teacher_models, _ = checkpoint_utils.load_model_ensemble([pretrain_ckpt])
     student = student_models[0].to(device)
     student.train()
-    teacher = teacher_models[0].to(device)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-    return student, teacher
+    return student
 
 
 def conv_layers_from_cfg(model) -> list:
@@ -145,6 +141,17 @@ def save_fairseq_checkpoint(path: str, student, pretrain_ckpt: str, num_updates:
     logger.info("Saved checkpoint to %s", path)
 
 
+def _top_per_class_neg_rates(per_class: dict, top_n: int = 5) -> str:
+    if not per_class:
+        return ""
+    ranked = sorted(per_class.items(), key=lambda kv: kv[1].get("anchors", 0), reverse=True)[:top_n]
+    parts = []
+    for name, bucket in ranked:
+        rate = bucket.get("neg_diff_class_rate", 0.0)
+        parts.append(f"{name}={rate:.2f}")
+    return " top_neg_diff=" + ",".join(parts)
+
+
 def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -154,8 +161,7 @@ def train(args):
         device = "cpu"
         logger.warning("CUDA unavailable; using CPU")
 
-    # --- Models: student learns, teacher stays at pretrain weights ---
-    student, teacher = load_models(args.pretrain_ckpt, device)
+    student = load_student(args.pretrain_ckpt, device)
     if args.freeze_feature_extractor:
         freeze_feature_extractor(student)
 
@@ -163,7 +169,6 @@ def train(args):
     sample_rate = sample_rate_from_cfg(student)
     logger.info("sample_rate=%s conv_layers=%s", sample_rate, conv_layers)
 
-    # --- Data: manifest wavs + CSV vocal intervals -> encoder-frame triplets ---
     label_cfg = LabelConfig(
         label_csv_dir=args.label_csv_dir,
         label_csv_format=args.label_csv_format,
@@ -197,7 +202,11 @@ def train(args):
     rng = np.random.default_rng(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # --- Training loop: fixed number of optimizer steps (not epochs) ---
+    run_stats = SamplingStats()
+    train_start = time.perf_counter()
+    step_times: list = []
+    stats_jsonl_path = os.path.join(args.save_dir, "training_stats.jsonl")
+
     step = 0
     data_iter = iter(loader)
     while step < args.max_updates:
@@ -210,36 +219,30 @@ def train(args):
         if not batch:
             continue
 
+        step_t0 = time.perf_counter()
         source = batch["source"].to(device)
         lr = get_lr(step, args.warmup_updates, args.max_updates, args.lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Pretrain checkpoints enable BC mixup in forward(); disable for contrastive finetune.
         mixup_saved = getattr(student.cfg, "source_mixup", -1)
         student.cfg.source_mixup = -1
 
-        # Frame embeddings: (B, T, D) from top-K averaged transformer layers
         student_out = student.extract_features(source=source, mask=False)
         s_emb = average_layer_embeddings(student, student_out["layer_results"], args.average_top_k_layers)
 
-        with torch.no_grad():
-            teacher_out = teacher.extract_features(source=source, mask=False)
-            t_emb = average_layer_embeddings(teacher, teacher_out["layer_results"], args.average_top_k_layers)
-
         student.cfg.source_mixup = mixup_saved
 
-        # Triplet + teacher-anchor loss; skip step if no valid triplets in batch
         loss, stats = compute_contrastive_loss(
             s_emb,
-            t_emb,
             batch["vocal_spans_enc"],
             batch["non_vocal_enc"],
             margin=args.margin,
-            anchor_weight=args.anchor_weight,
             rng=rng,
             class_aware=args.class_aware,
             vocal_span_classes=batch.get("vocal_span_classes"),
+            noise_prob=args.noise_negative_prob,
+            stats_accumulator=run_stats,
         )
 
         if stats["valid_triplets"] == 0:
@@ -250,36 +253,40 @@ def train(args):
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
         step += 1
+        step_times.append(time.perf_counter() - step_t0)
 
         if step % args.log_interval == 0:
-            # Healthy training: pos_dist < neg_dist, loss_triplet decreasing
-            if args.class_aware:
-                logger.info(
-                    "update=%d loss=%.4f triplet=%.4f anchor=%.4f pos=%.4f neg=%.4f "
-                    "triplets=%d pos_same_cls=%d neg_diff_cls=%d lr=%.2e",
-                    step,
-                    float(loss.detach()),
-                    stats["loss_triplet"],
-                    stats["loss_anchor"],
-                    stats["pos_dist"],
-                    stats["neg_dist"],
-                    stats["valid_triplets"],
-                    stats.get("pos_same_class", 0),
-                    stats.get("neg_diff_class", 0),
-                    lr,
-                )
-            else:
-                logger.info(
-                    "update=%d loss=%.4f triplet=%.4f anchor=%.4f pos=%.4f neg=%.4f triplets=%d lr=%.2e",
-                    step,
-                    float(loss.detach()),
-                    stats["loss_triplet"],
-                    stats["loss_anchor"],
-                    stats["pos_dist"],
-                    stats["neg_dist"],
-                    stats["valid_triplets"],
-                    lr,
-                )
+            recent = step_times[-args.log_interval :]
+            sec_per_update = sum(recent) / max(len(recent), 1)
+            neg_diff_rate = stats.get("neg_diff_class_rate", 0.0)
+            neg_same_rate = stats.get("neg_same_class_rate", 0.0)
+            pos_same_rate = stats.get("pos_same_class_rate", 0.0)
+            per_class_hint = _top_per_class_neg_rates(stats.get("per_class_sampling", {}))
+            logger.info(
+                "update=%d loss=%.4f triplet=%.4f pos=%.4f neg=%.4f triplets=%d "
+                "pos_same=%.2f neg_diff=%.2f neg_same=%.2f sec/up=%.3f lr=%.2e%s",
+                step,
+                float(loss.detach()),
+                stats["loss_triplet"],
+                stats["pos_dist"],
+                stats["neg_dist"],
+                stats["valid_triplets"],
+                pos_same_rate,
+                neg_diff_rate,
+                neg_same_rate,
+                sec_per_update,
+                lr,
+                per_class_hint,
+            )
+            log_row = {
+                "update": step,
+                "loss": float(loss.detach()),
+                "sec_per_update": sec_per_update,
+                **{k: stats[k] for k in stats if k != "per_class_sampling"},
+                "per_class_sampling": stats.get("per_class_sampling", {}),
+            }
+            with open(stats_jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_row) + "\n")
 
         if step % args.save_interval_updates == 0 or step == args.max_updates:
             ckpt_path = os.path.join(args.save_dir, f"checkpoint_{step}.pt")
@@ -293,7 +300,37 @@ def train(args):
             )
             student.to(device)
 
-    logger.info("Training finished after %d updates", step)
+    total_wall_s = time.perf_counter() - train_start
+    mean_step_s = sum(step_times) / max(len(step_times), 1)
+    median_step_s = float(np.median(step_times)) if step_times else 0.0
+
+    summary = {
+        "args": vars(args),
+        "sampling_config": {
+            "noise_prob": args.noise_negative_prob,
+            "same_clip_vocal_negative": False,
+            "class_aware": args.class_aware,
+        },
+        "runtime": {
+            "total_wall_seconds": total_wall_s,
+            "total_wall_hours": total_wall_s / 3600.0,
+            "mean_sec_per_update": mean_step_s,
+            "median_sec_per_update": median_step_s,
+            "num_updates": step,
+        },
+        "sampling_stats": run_stats.to_dict(),
+    }
+    summary_path = os.path.join(args.save_dir, "training_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info(
+        "Training finished after %d updates (wall=%.1fs, mean_sec/up=%.3f, summary=%s)",
+        step,
+        total_wall_s,
+        mean_step_s,
+        summary_path,
+    )
 
 
 def main():
